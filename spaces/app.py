@@ -14,15 +14,6 @@ import torch
 import matplotlib.pyplot as plt
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Try to import environment (may fail if Docker not available)
-ENV_AVAILABLE = False
-try:
-    import docker
-    docker.from_env().ping()
-    ENV_AVAILABLE = True
-except:
-    pass
-
 
 # ============== Configuration ==============
 
@@ -93,10 +84,10 @@ def load_model(model_name: str, progress=gr.Progress()):
         model_name,
         torch_dtype=dtype,
         device_map="auto" if device == "cuda" else None,
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
 
-    # Resize embeddings to match tokenizer
     model.resize_token_embeddings(len(tokenizer))
 
     if device == "cpu":
@@ -110,8 +101,71 @@ def load_model(model_name: str, progress=gr.Progress()):
     return f"✅ Model loaded: {model_name} on {device}"
 
 
-# ============== Environment Simulation ==============
-# (Used when Docker is not available)
+# ============== Real HTTP Environment ==============
+
+class RealEnvHTTP:
+    """HTTP client for the real Sysadmin Game environment server.
+
+    Mirrors the SimulatedEnv dict-based interface so run_episode works
+    unchanged whether we're talking to a real Docker sandbox or the fake sim.
+    """
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self.episode_id: Optional[str] = None
+
+    def _post(self, endpoint: str, payload: dict) -> dict:
+        from urllib import request as urlrequest
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        req = urlrequest.Request(
+            f"{self.base_url}{endpoint}", data=data, headers=headers, method="POST"
+        )
+        with urlrequest.urlopen(req, timeout=90.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def reset(self, scenario_id: Optional[str] = None) -> dict:
+        resp = self._post("/reset", {"scenario_id": scenario_id})
+        self.episode_id = resp["metadata"]["episode_id"]
+        return {
+            "output": resp["output"],
+            "done": resp["done"],
+            "reward": resp["reward"],
+            "metadata": resp["metadata"],
+        }
+
+    def step(self, command: str) -> dict:
+        resp = self._post("/step", {"command": command, "episode_id": self.episode_id})
+        return {
+            "output": resp["output"],
+            "done": resp["done"],
+            "reward": resp["reward"],
+            "metadata": resp["metadata"],
+        }
+
+
+def check_env_server(env_url: str) -> str:
+    """Ping the env server and return a status string."""
+    if not env_url.strip():
+        return "⚠️ No server URL — will use simulated environment"
+    try:
+        from urllib import request as urlrequest
+        url = env_url.rstrip("/") + "/health"
+        with urlrequest.urlopen(url, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        scenarios_url = env_url.rstrip("/") + "/scenarios"
+        with urlrequest.urlopen(scenarios_url, timeout=5.0) as resp:
+            sc = json.loads(resp.read().decode("utf-8"))
+        return (
+            f"✅ Connected to real environment server\n"
+            f"Status: {data.get('status')}  Active episodes: {data.get('active_episodes', 0)}\n"
+            f"Train scenarios: {', '.join(sc.get('train', []))}"
+        )
+    except Exception as e:
+        return f"❌ Cannot reach server at {env_url}\nError: {e}"
+
+
+# ============== Simulated Environment (fallback) ==============
 
 SIMULATED_SCENARIOS = [
     {
@@ -136,16 +190,22 @@ SIMULATED_SCENARIOS = [
 
 
 class SimulatedEnv:
-    """Simulated environment for when Docker isn't available."""
+    """Fallback when no real server URL is provided."""
 
     def __init__(self):
         self.scenario = None
         self.commands_run = []
         self.fixed = False
 
-    def reset(self):
+    def reset(self, scenario_id=None) -> dict:
         import random
-        self.scenario = random.choice(SIMULATED_SCENARIOS)
+        if scenario_id:
+            self.scenario = next(
+                (s for s in SIMULATED_SCENARIOS if s["id"] == scenario_id),
+                random.choice(SIMULATED_SCENARIOS),
+            )
+        else:
+            self.scenario = random.choice(SIMULATED_SCENARIOS)
         self.commands_run = []
         self.fixed = False
         return {
@@ -155,28 +215,22 @@ class SimulatedEnv:
             "metadata": {"scenario_id": self.scenario["id"]},
         }
 
-    def step(self, command: str):
+    def step(self, command: str) -> dict:
         self.commands_run.append(command)
-        reward = -0.01  # Step cost
+        reward = -0.01
 
-        # Check if diagnostic command
         for diag in self.scenario["diagnostics"]:
             if diag.split()[0] in command:
                 reward += 0.1
                 break
 
-        # Check if solution
         if re.search(self.scenario["solution_pattern"], command, re.IGNORECASE):
             self.fixed = True
             reward += 1.0
 
         done = self.fixed or len(self.commands_run) >= 15
-
-        # Simulate output
-        output = f"[Simulated output for: {command}]"
-
         return {
-            "output": output,
+            "output": f"[Simulated output for: {command}]",
             "done": done,
             "reward": reward,
             "metadata": {"scenario_id": self.scenario["id"], "fixed": self.fixed},
@@ -185,14 +239,14 @@ class SimulatedEnv:
 
 # ============== Episode Runner ==============
 
-def parse_response(response: str):
+def parse_response(response: str) -> Optional[str]:
     """Extract command from model response."""
     bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
     return bash_match.group(1).strip() if bash_match else None
 
 
-def run_episode(env, model, tokenizer, config: Config):
-    """Run single episode."""
+def run_episode(env, model, tokenizer, config: Config) -> dict:
+    """Run single episode against env (real or simulated)."""
     obs = env.reset()
 
     messages = [
@@ -211,13 +265,14 @@ def run_episode(env, model, tokenizer, config: Config):
 
     for turn in range(config.max_turns):
         try:
-            # Generate
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
             inputs = tokenizer(
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=config.max_seq_length - 200
+                max_length=config.max_seq_length - 200,
             ).to(model.device)
 
             with torch.no_grad():
@@ -230,7 +285,9 @@ def run_episode(env, model, tokenizer, config: Config):
                     eos_token_id=tokenizer.eos_token_id,
                 )
 
-            response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            response = tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+            )
             command = parse_response(response)
 
             trajectory["prompts"].append(prompt)
@@ -246,55 +303,51 @@ def run_episode(env, model, tokenizer, config: Config):
             total_reward += obs["reward"]
 
             messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "tool", "content": f"<output>\n{obs['output']}\n</output>"})
+            messages.append(
+                {"role": "tool", "content": f"<output>\n{obs['output']}\n</output>"}
+            )
 
             if obs["done"]:
                 break
 
         except Exception as e:
-            state.log(f"Turn {turn} error: {str(e)[:50]}")
+            state.log(f"Turn {turn} error: {str(e)[:80]}")
             trajectory["rewards"].append(-0.1)
             total_reward -= 0.1
             break
 
     trajectory["total_reward"] = total_reward
     trajectory["fixed"] = obs["metadata"].get("fixed", False)
-
     return trajectory
 
 
 # ============== GRPO Training ==============
 
-def compute_advantages(trajectories, group_size):
-    """Compute GRPO advantages."""
+def compute_advantages(trajectories: list, group_size: int) -> list:
+    """Compute GRPO advantages (normalize within group)."""
     processed = []
-
     for i in range(0, len(trajectories) - group_size + 1, group_size):
-        group = trajectories[i:i + group_size]
+        group = trajectories[i : i + group_size]
         rewards = [t["total_reward"] for t in group]
-
         mean_r = sum(rewards) / len(rewards)
-        std_r = max((sum((r - mean_r)**2 for r in rewards) / len(rewards))**0.5, 1e-6)
+        std_r = max((sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5, 1e-6)
 
         for traj in group:
             advantage = (traj["total_reward"] - mean_r) / std_r
-            for prompt, response, reward in zip(traj["prompts"], traj["responses"], traj["rewards"]):
-                processed.append({
-                    "prompt": prompt,
-                    "response": response,
-                    "advantage": advantage,
-                })
-
+            for prompt, response, reward in zip(
+                traj["prompts"], traj["responses"], traj["rewards"]
+            ):
+                processed.append(
+                    {"prompt": prompt, "response": response, "advantage": advantage}
+                )
     return processed
 
 
-def train_step(model, tokenizer, env, config: Config, optimizer):
+def train_step(model, tokenizer, env, config: Config, optimizer) -> tuple:
     """Single GRPO training step."""
-    # Clear CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Collect trajectories
     trajectories = []
     for _ in range(config.episodes_per_step):
         try:
@@ -302,19 +355,16 @@ def train_step(model, tokenizer, env, config: Config, optimizer):
             trajectories.append(traj)
         except Exception as e:
             state.log(f"Episode failed: {str(e)[:100]}")
-            # Reset CUDA state on error
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     if not trajectories:
         return None, None, None
 
-    # Metrics
     rewards = [t["total_reward"] for t in trajectories]
     fix_rate = sum(1 for t in trajectories if t["fixed"]) / len(trajectories)
     avg_reward = sum(rewards) / len(rewards)
 
-    # GRPO update
     training_data = compute_advantages(trajectories, config.group_size)
     if not training_data:
         return avg_reward, fix_rate, 0.0
@@ -344,8 +394,14 @@ def train_step(model, tokenizer, env, config: Config, optimizer):
     return avg_reward, fix_rate, total_loss / max(len(training_data), 1)
 
 
-def run_training(num_steps: int, episodes_per_step: int, learning_rate: float, progress=gr.Progress()):
-    """Main training loop."""
+def run_training(
+    num_steps: int,
+    episodes_per_step: int,
+    learning_rate: float,
+    env_url: str,
+    progress=gr.Progress(),
+):
+    """Main training loop — uses real HTTP env if env_url is set, else simulated."""
     if state.model is None:
         return "❌ Load a model first!", None, ""
 
@@ -359,11 +415,18 @@ def run_training(num_steps: int, episodes_per_step: int, learning_rate: float, p
     state.total_steps = config.num_steps
     state.history = {"steps": [], "rewards": [], "fix_rates": [], "losses": []}
 
-    env = SimulatedEnv()
+    # Pick environment: real if URL provided, fake otherwise
+    if env_url.strip():
+        env = RealEnvHTTP(env_url.strip())
+        env_label = f"Real server: {env_url.strip()}"
+    else:
+        env = SimulatedEnv()
+        env_label = "Simulated (no server URL)"
+
     optimizer = torch.optim.AdamW(state.model.parameters(), lr=config.learning_rate)
 
-    state.log(f"Starting training: {config.num_steps} steps, {config.episodes_per_step} episodes/step")
-    state.log(f"Environment: {'Docker' if ENV_AVAILABLE else 'Simulated'}")
+    state.log(f"Starting training: {config.num_steps} steps, {config.episodes_per_step} eps/step")
+    state.log(f"Environment: {env_label}")
 
     for step in range(config.num_steps):
         if not state.is_training:
@@ -372,25 +435,26 @@ def run_training(num_steps: int, episodes_per_step: int, learning_rate: float, p
         state.current_step = step + 1
         progress((step + 1) / config.num_steps, desc=f"Step {step+1}/{config.num_steps}")
 
-        reward, fix_rate, loss = train_step(state.model, state.tokenizer, env, config, optimizer)
+        reward, fix_rate, loss = train_step(
+            state.model, state.tokenizer, env, config, optimizer
+        )
 
         if reward is not None:
             state.history["steps"].append(step + 1)
             state.history["rewards"].append(reward)
             state.history["fix_rates"].append(fix_rate)
             state.history["losses"].append(loss)
-            state.log(f"Step {step+1}: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f}")
+            state.log(
+                f"Step {step+1}: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f}"
+            )
 
     state.is_training = False
-
-    # Generate plot
     fig = create_training_plot()
-
-    return f"✅ Training complete! Final reward: {state.history['rewards'][-1]:.3f}", fig, "\n".join(state.logs[-20:])
+    final_reward = state.history["rewards"][-1] if state.history["rewards"] else 0.0
+    return f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-20:])
 
 
 def stop_training():
-    """Stop training."""
     state.is_training = False
     state.log("Training stopped by user")
     return "Training stopped"
@@ -403,20 +467,20 @@ def create_training_plot():
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    axes[0].plot(state.history["steps"], state.history["rewards"], 'b-', lw=2)
+    axes[0].plot(state.history["steps"], state.history["rewards"], "b-", lw=2)
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Reward")
     axes[0].set_title("Average Reward")
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(state.history["steps"], state.history["fix_rates"], 'g-', lw=2)
+    axes[1].plot(state.history["steps"], state.history["fix_rates"], "g-", lw=2)
     axes[1].set_xlabel("Step")
     axes[1].set_ylabel("Fix Rate")
     axes[1].set_title("Success Rate")
     axes[1].set_ylim(0, 1)
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(state.history["steps"], state.history["losses"], 'r-', lw=2)
+    axes[2].plot(state.history["steps"], state.history["losses"], "r-", lw=2)
     axes[2].set_xlabel("Step")
     axes[2].set_ylabel("Loss")
     axes[2].set_title("Policy Loss")
@@ -438,7 +502,9 @@ def run_demo(complaint: str):
         {"role": "user", "content": complaint},
     ]
 
-    prompt = state.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = state.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
     inputs = state.tokenizer(prompt, return_tensors="pt").to(state.model.device)
 
     with torch.no_grad():
@@ -450,7 +516,9 @@ def run_demo(complaint: str):
             pad_token_id=state.tokenizer.eos_token_id,
         )
 
-    response = state.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    response = state.tokenizer.decode(
+        outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+    )
     return response
 
 
@@ -458,10 +526,14 @@ def run_demo(complaint: str):
 
 with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🛠️ Sysadmin Game: GRPO Training")
-    gr.Markdown("Train LLMs to diagnose and fix Linux systems using reinforcement learning.")
+    gr.Markdown(
+        "Train LLMs to diagnose and fix Linux systems using reinforcement learning.\n\n"
+        "**With real environment:** Start your environment server locally, expose it via "
+        "ngrok, paste the URL below. **Without:** falls back to a simulated environment."
+    )
 
     with gr.Tabs():
-        # Setup Tab
+        # ── Setup Tab ──────────────────────────────────────────────────────────
         with gr.Tab("1. Setup"):
             gr.Markdown("### Load Model")
             with gr.Row():
@@ -472,20 +544,36 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
                         "Qwen/Qwen2.5-Coder-3B-Instruct",
                     ],
                     value="Qwen/Qwen2.5-Coder-0.5B-Instruct",
-                    label="Model"
+                    label="Model",
                 )
                 load_btn = gr.Button("Load Model", variant="primary")
             load_status = gr.Textbox(label="Status", interactive=False)
 
-            load_btn.click(load_model, inputs=[model_dropdown], outputs=[load_status])
+            gr.Markdown("### Environment Server (optional — for real Docker sandbox)")
+            with gr.Row():
+                env_url_input = gr.Textbox(
+                    label="Environment Server URL",
+                    placeholder="https://abc123.ngrok-free.app  (leave empty for simulated env)",
+                    scale=4,
+                )
+                check_btn = gr.Button("Check Connection", scale=1)
+            env_status = gr.Textbox(label="Environment Status", interactive=False, lines=3)
 
-        # Training Tab
+            load_btn.click(load_model, inputs=[model_dropdown], outputs=[load_status])
+            check_btn.click(check_env_server, inputs=[env_url_input], outputs=[env_status])
+
+        # ── Training Tab ───────────────────────────────────────────────────────
         with gr.Tab("2. Training"):
             gr.Markdown("### GRPO Training Configuration")
             with gr.Row():
                 num_steps = gr.Slider(10, 200, value=50, step=10, label="Training Steps")
                 episodes = gr.Slider(2, 16, value=4, step=2, label="Episodes per Step")
                 lr = gr.Number(value=1e-5, label="Learning Rate")
+
+            env_url_train = gr.Textbox(
+                label="Environment Server URL (copy from Setup tab)",
+                placeholder="https://abc123.ngrok-free.app  or leave empty for simulated",
+            )
 
             with gr.Row():
                 train_btn = gr.Button("Start Training", variant="primary")
@@ -497,18 +585,18 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
 
             train_btn.click(
                 run_training,
-                inputs=[num_steps, episodes, lr],
-                outputs=[train_status, train_plot, train_logs]
+                inputs=[num_steps, episodes, lr, env_url_train],
+                outputs=[train_status, train_plot, train_logs],
             )
             stop_btn.click(stop_training, outputs=[train_status])
 
-        # Demo Tab
+        # ── Demo Tab ───────────────────────────────────────────────────────────
         with gr.Tab("3. Demo"):
             gr.Markdown("### Test the Model")
             complaint_input = gr.Textbox(
                 label="User Complaint",
                 placeholder="e.g., nginx won't start, getting config errors",
-                lines=2
+                lines=2,
             )
             demo_btn = gr.Button("Get Diagnosis", variant="primary")
             demo_output = gr.Textbox(label="Model Response", lines=10)
@@ -521,7 +609,7 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
                     ["Can't write any files, getting 'No space left on device' errors"],
                     ["Getting permission denied when trying to read /var/log/syslog"],
                 ],
-                inputs=[complaint_input]
+                inputs=[complaint_input],
             )
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
