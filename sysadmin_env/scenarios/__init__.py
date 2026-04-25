@@ -29,17 +29,28 @@ ALL_SCENARIOS: dict[str, Type[BaseScenario]] = {
     "venv_broken": VenvBrokenScenario,
 }
 
-# Scenarios for training (all of them)
-TRAIN_SCENARIO_IDS = list(ALL_SCENARIOS.keys())
-
-# Scenarios for validation (one representative from each)
-VAL_SCENARIO_IDS = [
-    "ownership",  # Permissions
-    "nginx_syntax",  # Service config
-    "disk_full",  # Disk
-    "port_bound",  # Network
-    "runaway_cpu",  # Process
+# Default live-RL training scenarios. The remaining scenarios are held out for
+# the main before/after comparison so the headline results are not measured on
+# the same scenario IDs used by the environment rollouts.
+TRAIN_SCENARIO_IDS = [
+    "disk_full",
+    "nginx_syntax",
+    "ownership",
+    "port_bound",
+    "runaway_cpu",
 ]
+
+# Held-out evaluation scenarios. They still share broad sysadmin skills with
+# the train set, but require different concrete fixes.
+VAL_SCENARIO_IDS = [
+    "disk_full_alt",
+    "nginx_unknown",
+    "expired_cert",
+    "stale_pid",
+    "venv_broken",
+]
+
+HELDOUT_SCENARIO_IDS = VAL_SCENARIO_IDS
 
 
 def get_scenario(scenario_id: str) -> BaseScenario:
