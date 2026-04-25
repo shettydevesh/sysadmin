@@ -11,7 +11,7 @@ MAX_OUTPUT_SIZE = 2048  # 2KB truncation
 class DockerSandbox:
     """Manages a Docker container for running scenarios."""
 
-    IMAGE = "ubuntu:22.04"
+    IMAGE = "sysadmin-sandbox:latest"
     CONTAINER_PREFIX = "sysadmin_env_"
 
     def __init__(self):
@@ -41,12 +41,15 @@ class DockerSandbox:
         # Create container with systemd support
         self.container = self.client.containers.run(
             self.IMAGE,
-            command="/sbin/init",
+            command="/lib/systemd/systemd",
             name=name,
             detach=True,
             privileged=True,
             # tmpfs for faster operation
             tmpfs={"/run": "", "/run/lock": ""},
+            # Cgroup settings for systemd
+            cgroupns="host",
+            volumes={"/sys/fs/cgroup": {"bind": "/sys/fs/cgroup", "mode": "rw"}},
             # Don't auto-remove so we can inspect on failure
             remove=False,
         )
