@@ -24,6 +24,12 @@ def format_for_training(examples: list[dict]) -> list[dict]:
     return formatted
 
 
+def filter_by_scenarios(examples: list[dict], scenario_ids: list[str]) -> list[dict]:
+    """Keep only examples whose scenario_id is in the provided split."""
+    allowed = set(scenario_ids)
+    return [ex for ex in examples if ex.get("scenario_id") in allowed]
+
+
 def main():
     parser = argparse.ArgumentParser(description="SFT training for Sysadmin agent")
     parser.add_argument("--train", type=str, default="dataset/sft_train.jsonl",
@@ -48,6 +54,8 @@ def main():
                         help="W&B project name")
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable W&B logging")
+    parser.add_argument("--scenario-split", choices=["official", "all"], default="official",
+                        help="Use official train/held-out split or every dataset scenario")
     args = parser.parse_args()
 
     # Check if dataset exists
@@ -64,6 +72,14 @@ def main():
     if Path(args.val).exists():
         val_data = load_dataset(args.val)
         print(f"Loaded {len(val_data)} validation examples")
+
+    if args.scenario_split == "official":
+        from sysadmin_env.scenarios import TRAIN_SCENARIO_IDS, VAL_SCENARIO_IDS
+
+        train_data = filter_by_scenarios(train_data, TRAIN_SCENARIO_IDS)
+        val_data = filter_by_scenarios(val_data, VAL_SCENARIO_IDS)
+        print(f"Official split: {len(train_data)} train examples from {TRAIN_SCENARIO_IDS}")
+        print(f"Official split: {len(val_data)} held-out validation examples from {VAL_SCENARIO_IDS}")
 
     # Import training libraries
     try:

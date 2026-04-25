@@ -9,6 +9,7 @@ def run_interactive_demo(
     scenario_id: str = "ownership",
     trained_checkpoint: Optional[str] = None,
     show_thinking: bool = True,
+    pause_between_agents: bool = True,
 ):
     """Run an interactive demo comparing agents.
 
@@ -80,7 +81,8 @@ def run_interactive_demo(
             print(f"   Total reward: {obs.metadata.get('total_reward', 0):.3f}")
             print("="*50)
 
-        input("\nPress Enter to continue to next agent...")
+        if pause_between_agents:
+            input("\nPress Enter to continue to next agent...")
 
 
 def main():
@@ -91,12 +93,15 @@ def main():
                         help="Path to trained model checkpoint")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Hide agent thinking")
+    parser.add_argument("--no-pause", action="store_true",
+                        help="Run both agents without waiting for input")
     args = parser.parse_args()
 
     run_interactive_demo(
         scenario_id=args.scenario,
         trained_checkpoint=args.trained,
         show_thinking=not args.no_thinking,
+        pause_between_agents=not args.no_pause,
     )
 
 

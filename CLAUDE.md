@@ -48,6 +48,10 @@ Each scenario is a Python module with `break(container)` and `check_fixed(contai
 
 **Total**: 92 training examples, 10 validation examples
 
+Default official split for live RL/eval:
+- Train scenarios: `disk_full`, `nginx_syntax`, `ownership`, `port_bound`, `runaway_cpu`
+- Held-out eval scenarios: `disk_full_alt`, `nginx_unknown`, `expired_cert`, `stale_pid`, `venv_broken`
+
 ## Dataset
 
 Located in `dataset/`:
@@ -115,18 +119,17 @@ python -c "from scenarios.nginx_config import break_system; break_system('test')
 docker exec -it test bash  # diagnose manually
 python -c "from scenarios.nginx_config import check_fixed; print(check_fixed('test'))"
 
-# Start OpenEnv HTTP server
-python -m sysadmin_env.server --port 8080
+# Start environment HTTP server
+python -m sysadmin_env.server.app
 
 # Run SFT training (Phase 1, ~30 min on A100)
-python train_sft.py --train dataset/sft_train.jsonl --val dataset/sft_val.jsonl --epochs 2
+python -m training.train_sft --train dataset/sft_train.jsonl --val dataset/sft_val.jsonl --scenario-split official --epochs 2
 
 # Run GRPO training (Phase 2)
-python train_grpo.py --env-url http://localhost:8080 --steps 500
+python -m training.train_openenv_grpo --model checkpoints/sft --steps 500
 
 # Evaluate on held-out scenarios
-python eval.py --model baseline --scenarios held_out
-python eval.py --model trained --scenarios held_out
+python -m training.evaluate --baseline random --trained checkpoints/grpo-openenv --split val
 ```
 
 ## Project Structure
@@ -136,18 +139,24 @@ dataset/
 ├── sft_train.jsonl      # 92 training examples (chat format)
 └── sft_val.jsonl        # 10 validation examples
 
+openenv.yaml             # OpenEnv manifest for packaging/deployment
+
 sysadmin_env/
 ├── scenarios/           # 10 break/check Python modules
 ├── sandbox.py           # Docker container management
-├── env.py               # OpenEnv wrapper (reset/step)
-├── server.py            # HTTP server for training loop
+├── environment.py       # OpenEnv-style wrapper (reset/step/state)
+├── client.py            # HTTP/OpenEnv client boundary
+├── openenv_adapter.py   # TRL environment_factory adapter
+├── server/app.py        # HTTP server for training loop and demos
+├── server/openenv_app.py # Optional OpenEnv create_app entrypoint
 ├── reward.py            # Reward calculation
 └── blocklist.py         # Destructive command detection
 
 training/
 ├── train_sft.py         # Unsloth SFT warm-start
-├── train_grpo.py        # TRL GRPO training loop
-└── eval.py              # Held-out evaluation
+├── train_openenv_grpo.py # TRL GRPOTrainer + OpenEnv environment_factory
+├── train_grpo.py        # Legacy custom rollout fallback
+└── evaluate.py          # Held-out evaluation and plots
 ```
 
 ## Critical Constraints

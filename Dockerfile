@@ -13,14 +13,15 @@ WORKDIR /app
 RUN pip install uv
 
 # Copy project files
-COPY pyproject.toml .
+COPY pyproject.toml README.md openenv.yaml ./
 COPY sysadmin_env/ sysadmin_env/
 
 # Install dependencies using uv
 RUN uv pip install --system -e .
 
-# Expose the server port
-EXPOSE 8000
+# Expose the Hugging Face Spaces default port
+ENV PORT=7860
+EXPOSE 7860
 
 # Run the server
-CMD ["uvicorn", "sysadmin_env.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn sysadmin_env.server.app:app --host 0.0.0.0 --port ${PORT}"]

@@ -8,9 +8,6 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-import matplotlib.pyplot as plt
-import numpy as np
-
 
 @dataclass
 class EpisodeResult:
@@ -133,6 +130,7 @@ def evaluate_agent(
     scenario_ids: list[str],
     num_episodes_per_scenario: int = 1,
     model_name: str = "unknown",
+    env_url: Optional[str] = None,
 ) -> EvalResults:
     """Evaluate an agent across multiple scenarios.
 
@@ -145,22 +143,30 @@ def evaluate_agent(
     Returns:
         EvalResults with all episode data
     """
-    from sysadmin_env import SysadminEnv
-
     print(f"\nEvaluating {model_name} on {len(scenario_ids)} scenarios...")
     episodes = []
 
-    with SysadminEnv() as env:
-        for scenario_id in scenario_ids:
-            for i in range(num_episodes_per_scenario):
-                print(f"  Running {scenario_id} ({i+1}/{num_episodes_per_scenario})...", end=" ")
-                try:
-                    result = run_episode(env, agent, scenario_id=scenario_id)
-                    episodes.append(result)
-                    status = "✓ Fixed" if result.fixed else "✗ Failed"
-                    print(f"{status} (reward={result.total_reward:.2f}, cmds={result.commands_used})")
-                except Exception as e:
-                    print(f"Error: {e}")
+    for scenario_id in scenario_ids:
+        for i in range(num_episodes_per_scenario):
+            print(f"  Running {scenario_id} ({i+1}/{num_episodes_per_scenario})...", end=" ")
+            env = None
+            try:
+                if env_url:
+                    from sysadmin_env import SysadminEnvClient
+                    env = SysadminEnvClient(base_url=env_url)
+                else:
+                    from sysadmin_env import SysadminEnv
+                    env = SysadminEnv()
+
+                result = run_episode(env, agent, scenario_id=scenario_id)
+                episodes.append(result)
+                status = "✓ Fixed" if result.fixed else "✗ Failed"
+                print(f"{status} (reward={result.total_reward:.2f}, cmds={result.commands_used})")
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                if env is not None and hasattr(env, "close"):
+                    env.close()
 
     return EvalResults(model_name=model_name, episodes=episodes)
 
@@ -173,6 +179,9 @@ def plot_comparison(baseline: EvalResults, trained: EvalResults, output_dir: str
         trained: Results from trained model
         output_dir: Directory to save plots
     """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -300,9 +309,13 @@ def main():
                         help="Baseline model type")
     parser.add_argument("--trained", type=str, default=None,
                         help="Path to trained model checkpoint")
-    parser.add_argument("--scenarios", type=str, nargs="+",
-                        default=["ownership", "nginx_syntax", "disk_full", "port_bound"],
-                        help="Scenarios to evaluate")
+    parser.add_argument("--scenarios", type=str, nargs="+", default=None,
+                        help="Scenarios to evaluate. Defaults to held-out validation split.")
+    parser.add_argument("--split", type=str, default="val",
+                        choices=["train", "val", "all"],
+                        help="Scenario split to evaluate when --scenarios is omitted")
+    parser.add_argument("--env-url", type=str, default=None,
+                        help="Remote Sysadmin Game server/HF Space URL")
     parser.add_argument("--episodes", type=int, default=1,
                         help="Episodes per scenario")
     parser.add_argument("--output", type=str, default="results",
@@ -313,6 +326,15 @@ def main():
 
     output_path = Path(args.output)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    if args.scenarios is None:
+        from sysadmin_env.scenarios import TRAIN_SCENARIO_IDS, VAL_SCENARIO_IDS, list_scenarios
+        if args.split == "train":
+            args.scenarios = TRAIN_SCENARIO_IDS
+        elif args.split == "val":
+            args.scenarios = VAL_SCENARIO_IDS
+        else:
+            args.scenarios = list_scenarios()
 
     # Create baseline agent
     if args.baseline == "random":
@@ -330,6 +352,7 @@ def main():
         args.scenarios,
         num_episodes_per_scenario=args.episodes,
         model_name=baseline_name,
+        env_url=args.env_url,
     )
 
     # Create trained agent if checkpoint provided
@@ -350,6 +373,7 @@ def main():
         args.scenarios,
         num_episodes_per_scenario=args.episodes,
         model_name=trained_name,
+        env_url=args.env_url,
     )
 
     # Print summary

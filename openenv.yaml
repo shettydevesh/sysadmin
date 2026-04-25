@@ -1,0 +1,27 @@
+name: sysadmin-game
+version: 0.1.0
+description: Real Linux troubleshooting environment for training LLM SRE agents.
+spec_version: 1
+
+client:
+  class_name: OpenEnvSysadminClient
+  module: sysadmin_env.client
+
+action:
+  class_name: Action
+  module: sysadmin_env.models
+
+observation:
+  class_name: Observation
+  module: sysadmin_env.models
+
+state:
+  class_name: State
+  module: sysadmin_env.models
+
+default_image: sysadmin-game:latest
+
+variables:
+  SYSADMIN_SANDBOX_BACKEND: docker
+  SYSADMIN_MAX_COMMANDS: "25"
+  SYSADMIN_MAX_TIME_SECONDS: "60"

@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "docker>=7.0.0",
     "fastapi>=0.110.0",
+    "openenv-core[core]>=0.2.1",
     "uvicorn>=0.27.0",
     "pydantic>=2.0.0",
 ]
@@ -35,6 +36,7 @@ eval = [
 [project.scripts]
 sysadmin-server = "sysadmin_env.server.app:main"
 sysadmin-train = "training.train_sft:main"
+sysadmin-train-grpo = "training.train_openenv_grpo:main"
 sysadmin-eval = "training.evaluate:main"
 
 [build-system]

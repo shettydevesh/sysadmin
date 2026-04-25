@@ -1,209 +1,240 @@
 # Sysadmin Game
 
-An OpenEnv-compliant RL environment for training LLMs on real Linux troubleshooting.
+An OpenEnv-compatible RL environment for training LLM agents to diagnose and
+fix real Linux incidents in sandboxed Ubuntu containers.
 
-## Overview
+## Submission Links
 
-Train Qwen2.5-Coder-7B to diagnose and fix broken Ubuntu containers using SFT warm-start + GRPO reinforcement learning.
+Fill these before final submission:
 
-**Why it matters**: LLMs hallucinate file paths, skip diagnostics, and propose fixes before reading errors. This environment provides unfakeable reward — a service is up or it isn't.
+| Artifact | Link |
+|---|---|
+| Hugging Face Space | TODO |
+| Colab training notebook | TODO |
+| W&B run or training logs | TODO |
+| Demo video / blog / slides | TODO |
+| Trained model checkpoint | TODO |
 
-## Quick Start
+## Why This Exists
+
+LLMs often sound confident while skipping the actual sysadmin workflow: inspect
+the error, find the root cause, make a minimal fix, then verify. Sysadmin Game
+turns that behavior into a trainable environment. The reward is grounded in the
+machine state: nginx starts or it does not, disk pressure is relieved or it is
+not, the certificate validates or it does not.
+
+## What The Agent Sees And Does
+
+Each episode starts with a realistic user complaint. The agent can run one bash
+command at a time through the environment. The environment returns command
+output, reward, done state, and metadata.
+
+```text
+User complaint:
+nginx won't start. Says 'Address already in use'. I need the web server back up ASAP!
+
+Agent action:
+ss -tlnp | grep ':80 '
+
+Environment output:
+LISTEN ... users:(("apache2",pid=...))
+reward=+0.09 done=False fixed=False
+```
+
+The model is rewarded for fixing the incident, gently rewarded for useful first
+diagnostics, penalized per command, and terminated for destructive commands.
+
+## OpenEnv Shape
+
+This repo includes the OpenEnv-facing pieces required for packaging and remote
+training:
+
+- `openenv.yaml`: manifest for environment discovery.
+- `sysadmin_env/models.py`: typed `Action`, `Observation`, and `State` schemas.
+- `sysadmin_env/client.py`: HTTP client plus optional OpenEnv-native client.
+- `sysadmin_env/server/app.py`: HTTP server with reset, step, state, health, and scenario endpoints.
+- `sysadmin_env/server/openenv_app.py`: optional OpenEnv-native `create_app` entrypoint.
+- `sysadmin_env/openenv_adapter.py`: TRL `environment_factory` adapter exposing `run_shell(command)`.
+
+## Scenarios
+
+| Split | Scenario IDs |
+|---|---|
+| Train | `disk_full`, `nginx_syntax`, `ownership`, `port_bound`, `runaway_cpu` |
+| Held-out eval | `disk_full_alt`, `nginx_unknown`, `expired_cert`, `stale_pid`, `venv_broken` |
+
+All 10 scenarios are available through `/scenarios`. The default live RL and SFT
+commands use the train split, while evaluation defaults to held-out scenarios.
+
+## Local Setup
 
 ```bash
-# Install dependencies
-uv sync
+# Install project dependencies
+uv sync --extra dev --extra train --extra eval
 
-# Run tests
+# Build the Ubuntu/systemd sandbox used inside episodes
+docker build -f docker/sandbox.Dockerfile -t sysadmin-sandbox:latest .
+
+# Run unit tests
 uv run pytest tests/ -v
 
-# Start the HTTP server (requires Docker)
+# Start the environment API
 uv run sysadmin-server
 ```
 
-## Full Training Pipeline
+If `uv` is not installed, install it first or use your virtualenv/pip equivalent.
 
-### 1. Prepare Dataset
-
-Create `dataset/sft_train.jsonl` with training examples in chat format:
-
-```json
-{
-  "messages": [
-    {"role": "system", "content": "You are an SRE agent..."},
-    {"role": "user", "content": "nginx won't start after I edited the config."},
-    {"role": "assistant", "content": "<think>\nCheck nginx config syntax.\n</think>\n<bash>nginx -t</bash>"},
-    {"role": "tool", "content": "<output>\nnginx: syntax error...\n</output>"},
-    {"role": "assistant", "content": "<think>\nFound syntax error. Fix the config.\n</think>\n<bash>cat /etc/nginx/sites-available/default</bash>"}
-  ],
-  "scenario_id": "nginx_syntax"
-}
-```
-
-### 2. Train with SFT (Phase 1)
+## API Smoke Test
 
 ```bash
-# Install training dependencies
-uv sync --extra train
+curl http://localhost:8000/health
 
-# Run SFT training (~30 min on A100)
+curl -X POST http://localhost:8000/reset \
+  -H "Content-Type: application/json" \
+  -d '{"scenario_id": "port_bound"}'
+
+curl -X POST http://localhost:8000/step \
+  -H "Content-Type: application/json" \
+  -d '{"command": "ss -tlnp"}'
+
+curl http://localhost:8000/state
+```
+
+Each reset returns an `episode_id`. Pass it to `/step` when running parallel
+clients.
+
+## Training
+
+### Phase 1: SFT Warm Start
+
+```bash
 uv run python -m training.train_sft \
   --train dataset/sft_train.jsonl \
   --val dataset/sft_val.jsonl \
+  --scenario-split official \
   --epochs 2 \
   --output checkpoints/sft
 ```
 
-### 3. Evaluate Trained vs Baseline
+Use `--scenario-split all` only for ablations. The official split keeps held-out
+scenario IDs out of the SFT training set.
+
+### Phase 2: GRPO Against Live Environment
+
+Recommended path for the hackathon evidence:
 
 ```bash
-# Install eval dependencies
-uv sync --extra eval
+uv run python -m training.train_openenv_grpo \
+  --model checkpoints/sft \
+  --steps 200 \
+  --num-generations 4 \
+  --output checkpoints/grpo-openenv
+```
 
-# Run evaluation (requires Docker)
+To train against a deployed Space/server:
+
+```bash
+uv run python -m training.train_openenv_grpo \
+  --model checkpoints/sft \
+  --env-url https://YOUR-SPACE.hf.space \
+  --steps 200 \
+  --output checkpoints/grpo-openenv
+```
+
+The older `training.train_grpo` script remains as a fallback custom rollout
+loop. The submission should prefer `training.train_openenv_grpo`.
+
+## Evaluation
+
+```bash
 uv run python -m training.evaluate \
   --baseline random \
-  --trained checkpoints/sft \
-  --scenarios ownership nginx_syntax disk_full port_bound \
+  --trained checkpoints/grpo-openenv \
+  --split val \
   --episodes 3 \
   --output results/
 ```
 
-This generates:
-- `results/success_rate.png` - Success rate comparison
-- `results/avg_reward.png` - Average reward comparison
-- `results/commands_to_fix.png` - Efficiency comparison
-- `results/baseline_vs_trained.png` - Combined comparison
-- `results/eval_results.json` - Full metrics
-
-### 4. Interactive Demo
+Remote evaluation:
 
 ```bash
-# Compare agents side-by-side
+uv run python -m training.evaluate \
+  --baseline random \
+  --trained checkpoints/grpo-openenv \
+  --env-url https://YOUR-SPACE.hf.space \
+  --split val \
+  --episodes 3 \
+  --output results/
+```
+
+Expected output files:
+
+- `results/success_rate.png`
+- `results/avg_reward.png`
+- `results/commands_to_fix.png`
+- `results/baseline_vs_trained.png`
+- `results/per_scenario.png`
+- `results/eval_results.json`
+
+Commit the final plots and metrics before submission.
+
+## Demo
+
+```bash
 uv run python -m training.demo \
-  --scenario ownership \
-  --trained checkpoints/sft
+  --scenario port_bound \
+  --trained checkpoints/grpo-openenv \
+  --no-pause
 ```
 
-## HTTP API
+The strongest video is a side-by-side story: random/base agent loops or restarts
+blindly; trained agent checks status/logs, identifies root cause, fixes, and
+verifies.
+
+## Hugging Face Space
+
+The Dockerfile is configured for the HF Spaces default port (`7860`):
 
 ```bash
-# Reset to a new episode
-curl -X POST http://localhost:8000/reset \
-  -H "Content-Type: application/json" \
-  -d '{"scenario_id": "nginx_syntax"}'
-
-# Execute a command
-curl -X POST http://localhost:8000/step \
-  -H "Content-Type: application/json" \
-  -d '{"command": "systemctl status nginx"}'
-
-# Get current state
-curl http://localhost:8000/state
-
-# List scenarios
-curl http://localhost:8000/scenarios
+docker build -t sysadmin-game:latest .
+docker run -p 7860:7860 sysadmin-game:latest
 ```
 
-## Scenarios
+For OpenEnv deployment, validate and push from the repo root after installing
+the latest OpenEnv CLI:
 
-| ID | Category | Description |
-|----|----------|-------------|
-| disk_full | Disk | /var/log filled with large file |
-| disk_full_alt | Disk | Disk filled via syslog |
-| nginx_syntax | Service | Invalid nginx config syntax |
-| nginx_unknown | Service | Unknown directive in nginx config |
-| ownership | Permissions | Wrong file ownership |
-| port_bound | Network | Another process using port 80 |
-| runaway_cpu | Process | Infinite loop consuming CPU |
-| expired_cert | TLS | SSL certificate expired |
-| stale_pid | Service | Leftover PID file |
-| venv_broken | Environment | Broken Python venv symlinks |
+```bash
+openenv validate --verbose
+openenv push --repo-id YOUR_USER/sysadmin-game
+```
 
-## Reward Structure
+Note: the full local training environment uses Docker to create fresh Ubuntu
+systemd sandboxes. If the deployment target does not provide a Docker daemon,
+use the Space as the discoverable API/demo surface and run training/evaluation
+on local or cloud GPU machines with Docker enabled.
+
+## Reward
 
 | Condition | Reward |
-|-----------|--------|
-| Issue fixed | +1.0 |
-| Per command | -0.01 |
-| First diagnostic command | +0.1 |
-| Destructive command | -0.5 + termination |
+|---|---:|
+| Incident fixed (`check_fixed()` true) | `+1.0` |
+| Command cost | `-0.01` |
+| First useful diagnostic command | `+0.1` |
+| Destructive command | `-0.5` and terminate |
 
-**Diagnostic commands** (bonus on first use): systemctl status, journalctl, df, ls, cat, ps, ss, netstat, grep, head, tail, lsof, du, free, top
+## Results To Report
 
-## Episode Constraints
+Before submission, replace this section with real numbers:
 
-- 25 command limit
-- 60 second timeout
-- 2KB output truncation per command
-- Fresh container on each reset
+| Metric | Random/Base | SFT | SFT + GRPO |
+|---|---:|---:|---:|
+| Held-out success rate | TODO | TODO | TODO |
+| Average reward | TODO | TODO | TODO |
+| Commands to fix | TODO | TODO | TODO |
+| Unsafe command rate | TODO | TODO | TODO |
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Training Loop (Colab/Local)                            │
-│  Unsloth + TRL, LoRA r=16, 4-bit quantization          │
-└──────────────────────┬──────────────────────────────────┘
-                       │ HTTP API
-┌──────────────────────▼──────────────────────────────────┐
-│  OpenEnv Wrapper (sysadmin_env)                         │
-│  reset() → breaks container, returns user complaint     │
-│  step(action) → executes command, returns reward        │
-└──────────────────────┬──────────────────────────────────┘
-                       │ docker exec
-┌──────────────────────▼──────────────────────────────────┐
-│  Sandbox Layer (Docker)                                 │
-│  ubuntu:22.04 + systemd, 10 scenario modules           │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Agent Response Format
-
-The model outputs reasoning in `<think>` tags, then a single command in `<bash>` tags:
-
-```
-<think>
-Port 80 is taken. Find the holder.
-</think>
-<bash>ss -tlnp | grep ':80 '</bash>
-```
-
-## Project Structure
-
-```
-sysadmin_env/
-├── __init__.py          # Package exports
-├── models.py            # Action, Observation, State
-├── environment.py       # Core SysadminEnv class
-├── sandbox.py           # Docker container management
-├── reward.py            # Reward calculation
-├── blocklist.py         # Destructive command detection
-├── scenarios/           # 10 scenario implementations
-└── server/app.py        # FastAPI HTTP server
-
-training/
-├── agent.py             # SysadminAgent, RandomAgent
-├── train_sft.py         # SFT training script
-├── evaluate.py          # Evaluation + plotting
-└── demo.py              # Interactive comparison demo
-
-dataset/
-├── sft_train.jsonl      # Training examples
-└── sft_val.jsonl        # Validation examples
-
-results/                 # Generated plots and metrics
-```
-
-## Expected Results
-
-After SFT training on 92 examples:
-
-| Metric | Random Baseline | Trained Model |
-|--------|-----------------|---------------|
-| Success Rate | ~10% | ~60-80% |
-| Avg Reward | -0.15 | +0.70 |
-| Commands to Fix | N/A | 4-8 |
+Embed the final plots here with one-line captions so judges can understand the
+improvement in under a minute.
 
 ## License
 
