@@ -1,0 +1,49 @@
+[project]
+name = "sysadmin-game"
+version = "0.1.0"
+description = "OpenEnv-compliant RL environment for training LLMs on Linux troubleshooting"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "docker>=7.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+train = [
+    "unsloth",
+    "trl>=0.8.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "wandb>=0.16.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "peft>=0.10.0",
+    "bitsandbytes>=0.43.0",
+]
+eval = [
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+sysadmin-server = "sysadmin_env.server.app:main"
+sysadmin-train = "training.train_sft:main"
+sysadmin-eval = "training.evaluate:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sysadmin_env", "training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
