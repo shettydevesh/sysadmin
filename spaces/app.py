@@ -57,8 +57,8 @@ class TrainingState:
 
     def log(self, msg: str):
         self.logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(self.logs) > 100:
-            self.logs = self.logs[-100:]
+        if len(self.logs) > 500:
+            self.logs = self.logs[-500:]
 
 state = TrainingState()
 
@@ -245,9 +245,11 @@ def parse_response(response: str) -> Optional[str]:
     return bash_match.group(1).strip() if bash_match else None
 
 
-def run_episode(env, model, tokenizer, config: Config) -> dict:
+def run_episode(env, model, tokenizer, config: Config, episode_num: int = 0) -> dict:
     """Run single episode against env (real or simulated)."""
     obs = env.reset()
+    scenario_id = obs["metadata"]["scenario_id"]
+    state.log(f"  Episode {episode_num}: scenario={scenario_id}")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -255,10 +257,11 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
     ]
 
     trajectory = {
-        "scenario_id": obs["metadata"]["scenario_id"],
+        "scenario_id": scenario_id,
         "prompts": [],
         "responses": [],
         "rewards": [],
+        "commands": [],
     }
 
     total_reward = 0.0
@@ -292,15 +295,22 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
 
             trajectory["prompts"].append(prompt)
             trajectory["responses"].append(response)
+            trajectory["commands"].append(command)
 
             if not command:
+                state.log(f"    Turn {turn}: no command extracted, penalty -0.1")
                 trajectory["rewards"].append(-0.1)
                 total_reward -= 0.1
                 break
 
             obs = env.step(command)
-            trajectory["rewards"].append(obs["reward"])
-            total_reward += obs["reward"]
+            reward = obs["reward"]
+            trajectory["rewards"].append(reward)
+            total_reward += reward
+
+            # Log command and reward
+            cmd_short = command[:40] + "..." if len(command) > 40 else command
+            state.log(f"    Turn {turn}: `{cmd_short}` → reward={reward:+.2f}")
 
             messages.append({"role": "assistant", "content": response})
             messages.append(
@@ -308,16 +318,20 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
             )
 
             if obs["done"]:
+                fixed = obs["metadata"].get("fixed", False)
+                reason = obs["metadata"].get("termination_reason", "unknown")
+                state.log(f"    Done: fixed={fixed}, reason={reason}, total={total_reward:+.2f}")
                 break
 
         except Exception as e:
-            state.log(f"Turn {turn} error: {str(e)[:80]}")
+            state.log(f"    Turn {turn} error: {str(e)[:60]}")
             trajectory["rewards"].append(-0.1)
             total_reward -= 0.1
             break
 
     trajectory["total_reward"] = total_reward
     trajectory["fixed"] = obs["metadata"].get("fixed", False)
+    trajectory["num_commands"] = len([c for c in trajectory["commands"] if c])
     return trajectory
 
 
@@ -343,34 +357,45 @@ def compute_advantages(trajectories: list, group_size: int) -> list:
     return processed
 
 
-def train_step(model, tokenizer, env, config: Config, optimizer) -> tuple:
+def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int = 0) -> tuple:
     """Single GRPO training step."""
+    state.log(f"Step {step_num}: Collecting {config.episodes_per_step} episodes...")
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     trajectories = []
-    for _ in range(config.episodes_per_step):
+    for ep_idx in range(config.episodes_per_step):
         try:
-            traj = run_episode(env, model, tokenizer, config)
+            traj = run_episode(env, model, tokenizer, config, episode_num=ep_idx)
             trajectories.append(traj)
         except Exception as e:
-            state.log(f"Episode failed: {str(e)[:100]}")
+            state.log(f"  Episode {ep_idx} failed: {str(e)[:80]}")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     if not trajectories:
+        state.log(f"Step {step_num}: No trajectories collected!")
         return None, None, None
 
+    # Summarize episodes
     rewards = [t["total_reward"] for t in trajectories]
-    fix_rate = sum(1 for t in trajectories if t["fixed"]) / len(trajectories)
+    fix_count = sum(1 for t in trajectories if t["fixed"])
+    fix_rate = fix_count / len(trajectories)
     avg_reward = sum(rewards) / len(rewards)
+    total_cmds = sum(t.get("num_commands", 0) for t in trajectories)
+
+    state.log(f"Step {step_num}: Episodes done - avg_reward={avg_reward:.3f}, fixed={fix_count}/{len(trajectories)}, commands={total_cmds}")
 
     training_data = compute_advantages(trajectories, config.group_size)
     if not training_data:
+        state.log(f"Step {step_num}: No training data after advantage computation")
         return avg_reward, fix_rate, 0.0
 
+    state.log(f"Step {step_num}: Training on {len(training_data)} examples...")
     model.train()
     total_loss = 0.0
+    valid_examples = 0
 
     for ex in training_data:
         inputs = tokenizer(
@@ -386,12 +411,16 @@ def train_step(model, tokenizer, env, config: Config, optimizer) -> tuple:
         if not (torch.isnan(loss) or torch.isinf(loss)):
             loss.backward()
             total_loss += loss.item()
+            valid_examples += 1
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     optimizer.zero_grad()
 
-    return avg_reward, fix_rate, total_loss / max(len(training_data), 1)
+    avg_loss = total_loss / max(valid_examples, 1)
+    state.log(f"Step {step_num}: Loss={avg_loss:.4f} (from {valid_examples} examples)")
+
+    return avg_reward, fix_rate, avg_loss
 
 
 def run_training(
@@ -430,13 +459,14 @@ def run_training(
 
     for step in range(config.num_steps):
         if not state.is_training:
+            state.log("Training stopped by user")
             break
 
         state.current_step = step + 1
         progress((step + 1) / config.num_steps, desc=f"Step {step+1}/{config.num_steps}")
 
         reward, fix_rate, loss = train_step(
-            state.model, state.tokenizer, env, config, optimizer
+            state.model, state.tokenizer, env, config, optimizer, step_num=step + 1
         )
 
         if reward is not None:
@@ -445,13 +475,14 @@ def run_training(
             state.history["fix_rates"].append(fix_rate)
             state.history["losses"].append(loss)
             state.log(
-                f"Step {step+1}: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f}"
+                f"═══ Step {step+1} Summary: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f} ═══"
             )
 
     state.is_training = False
+    state.log("Training complete!")
     fig = create_training_plot()
     final_reward = state.history["rewards"][-1] if state.history["rewards"] else 0.0
-    return f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-20:])
+    return f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-50:])
 
 
 def stop_training():
@@ -581,7 +612,7 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
 
             train_status = gr.Textbox(label="Status", interactive=False)
             train_plot = gr.Plot(label="Training Curves")
-            train_logs = gr.Textbox(label="Logs", lines=10, interactive=False)
+            train_logs = gr.Textbox(label="Logs", lines=20, interactive=False)
 
             train_btn.click(
                 run_training,
