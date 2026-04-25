@@ -82,6 +82,7 @@ def load_model(model_name: str, progress=gr.Progress()):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     progress(0.3, desc="Loading model...")
 
@@ -94,6 +95,9 @@ def load_model(model_name: str, progress=gr.Progress()):
         device_map="auto" if device == "cuda" else None,
         trust_remote_code=True,
     )
+
+    # Resize embeddings to match tokenizer
+    model.resize_token_embeddings(len(tokenizer))
 
     if device == "cpu":
         model = model.to(device)
@@ -206,38 +210,51 @@ def run_episode(env, model, tokenizer, config: Config):
     total_reward = 0.0
 
     for turn in range(config.max_turns):
-        # Generate
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        try:
+            # Generate
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=config.max_seq_length - 200
+            ).to(model.device)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=200,
-                temperature=config.temperature,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    temperature=config.temperature,
+                    do_sample=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
 
-        response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        command = parse_response(response)
+            response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            command = parse_response(response)
 
-        trajectory["prompts"].append(prompt)
-        trajectory["responses"].append(response)
+            trajectory["prompts"].append(prompt)
+            trajectory["responses"].append(response)
 
-        if not command:
+            if not command:
+                trajectory["rewards"].append(-0.1)
+                total_reward -= 0.1
+                break
+
+            obs = env.step(command)
+            trajectory["rewards"].append(obs["reward"])
+            total_reward += obs["reward"]
+
+            messages.append({"role": "assistant", "content": response})
+            messages.append({"role": "tool", "content": f"<output>\n{obs['output']}\n</output>"})
+
+            if obs["done"]:
+                break
+
+        except Exception as e:
+            state.log(f"Turn {turn} error: {str(e)[:50]}")
             trajectory["rewards"].append(-0.1)
             total_reward -= 0.1
-            break
-
-        obs = env.step(command)
-        trajectory["rewards"].append(obs["reward"])
-        total_reward += obs["reward"]
-
-        messages.append({"role": "assistant", "content": response})
-        messages.append({"role": "tool", "content": f"<output>\n{obs['output']}\n</output>"})
-
-        if obs["done"]:
             break
 
     trajectory["total_reward"] = total_reward
@@ -273,6 +290,10 @@ def compute_advantages(trajectories, group_size):
 
 def train_step(model, tokenizer, env, config: Config, optimizer):
     """Single GRPO training step."""
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Collect trajectories
     trajectories = []
     for _ in range(config.episodes_per_step):
@@ -280,7 +301,10 @@ def train_step(model, tokenizer, env, config: Config, optimizer):
             traj = run_episode(env, model, tokenizer, config)
             trajectories.append(traj)
         except Exception as e:
-            state.log(f"Episode failed: {e}")
+            state.log(f"Episode failed: {str(e)[:100]}")
+            # Reset CUDA state on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if not trajectories:
         return None, None, None
