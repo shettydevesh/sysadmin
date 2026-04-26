@@ -22,6 +22,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
+/results
 
 # Testing
 .pytest_cache/
@@ -35,6 +36,7 @@ htmlcov/
 *.log
 *PRD*
 checkpoints
+AGENTS.md
 
 # Local config
 .env

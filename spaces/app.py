@@ -102,9 +102,11 @@ def load_model(model_name: str, progress=gr.Progress()):
         )
 
         # Don't resize embeddings — Qwen models already match tokenizer size
-        # resize_token_embeddings can introduce uninitialized weights that
-        # cause CUDA asserts during generation on fp16/bf16
         state.log(f"Model vocab: {model.config.vocab_size}, tokenizer vocab: {len(tokenizer)}")
+
+        # Enable gradient checkpointing to reduce VRAM usage during training
+        model.gradient_checkpointing_enable()
+        state.log("Gradient checkpointing enabled (saves ~40% VRAM during training)")
 
         if device == "cpu":
             model = model.to(device)
@@ -333,6 +335,8 @@ def run_episode(env, model, tokenizer, config: Config, episode_num: int = 0) -> 
     """Run single episode against env (real or simulated)."""
     import traceback
 
+    model.eval()  # Disable gradient checkpointing for faster generation
+
     try:
         obs = env.reset()
     except Exception as e:
@@ -514,12 +518,19 @@ def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int =
         return avg_reward, fix_rate, 0.0
 
     state.log(f"Step {step_num}: Training on {len(training_data)} examples...")
+
+    # Free inference VRAM before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     model.train()
     total_loss = 0.0
     valid_examples = 0
     skipped_nan = 0
     skipped_error = 0
 
+    # Process one example at a time: forward → backward → step → zero
+    # This avoids holding multiple computation graphs in VRAM
     for idx, ex in enumerate(training_data):
         try:
             inputs = tokenizer(
@@ -534,29 +545,32 @@ def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int =
 
             if torch.isnan(loss) or torch.isinf(loss):
                 skipped_nan += 1
+                del inputs, outputs, loss
                 continue
 
             loss.backward()
             total_loss += loss.item()
             valid_examples += 1
 
+            # Step after each example to free graph memory immediately
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                optimizer.step()
+            optimizer.zero_grad()
+
+            # Free memory
+            del inputs, outputs, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         except Exception as e:
             skipped_error += 1
-            if skipped_error <= 2:  # Only log first few errors
+            if skipped_error <= 2:
                 state.log(f"  Training example {idx} error: {type(e).__name__}: {str(e)[:60]}")
+            optimizer.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    try:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-            state.log(f"  ⚠️ Gradient norm is {grad_norm:.4f} — skipping optimizer step to protect model")
-            optimizer.zero_grad()
-        else:
-            optimizer.step()
-            optimizer.zero_grad()
-            state.log(f"  Gradient norm: {grad_norm:.4f}")
-    except Exception as e:
-        state.log(f"  Optimizer step failed: {type(e).__name__}: {str(e)[:80]}")
-        optimizer.zero_grad()  # Clear bad gradients
 
     avg_loss = total_loss / max(valid_examples, 1)
 

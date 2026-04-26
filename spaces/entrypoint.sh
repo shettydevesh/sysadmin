@@ -1,15 +1,17 @@
 #!/bin/bash
 
-# Start Docker daemon in background (if available)
+# Try Docker daemon briefly, don't block if it fails
 if command -v dockerd &> /dev/null; then
-    echo "Starting Docker daemon..."
-    dockerd &
-    sleep 5
+    echo "Attempting Docker daemon..."
+    dockerd &> /dev/null &
+    sleep 3
 
-    # Build sandbox image
-    if docker info &> /dev/null; then
-        echo "Building sandbox image..."
-        docker build -t sysadmin-sandbox:latest -f docker/sandbox.Dockerfile . || true
+    # Quick check with timeout - don't hang
+    if timeout 5 docker info &> /dev/null 2>&1; then
+        echo "Docker available, building sandbox..."
+        timeout 120 docker build -t sysadmin-sandbox:latest -f docker/sandbox.Dockerfile . || echo "Sandbox build failed (non-critical)"
+    else
+        echo "Docker not available in this environment (expected on HF Spaces)"
     fi
 fi
 
