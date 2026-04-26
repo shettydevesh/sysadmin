@@ -174,6 +174,8 @@ No gold labels. No human annotation. No AI judge. Just: which of your own attemp
 
 After 50 steps, the model has played through 200 real broken server episodes. After 200 steps, it's seen 800. The weights drift toward behavior that fixes servers efficiently.
 
+> **Note on warm-starting:** We use the SFT checkpoint as the starting point for GRPO — it already knows the format, so RL can focus on strategy rather than syntax. That said, the GRPO Colab works fine starting from the base Qwen model if you skip Phase 1. SFT just makes the curves climb faster.
+
 ---
 
 ## 7. Training Results
@@ -209,6 +211,14 @@ After 50 steps, the model has played through 200 real broken server episodes. Af
 *Average number of commands needed to fix a scenario. Fewer = better. The model learns not to spam useless commands.*
 
 ![Commands to Fix](https://d2qt0ksb47ks9g.cloudfront.net/1777195108774_commands.png)
+
+---
+
+### Live Training Log
+
+*The model learning in real time. Step 1: reward -0.12, fix rate 0%. Step 2: reward +0.45, fix rate 50%. Each step is live episodes against real broken Docker containers.*
+
+![Training Log](https://d2qt0ksb47ks9g.cloudfront.net/1777200223681_training_log.jpeg)
 
 ---
 
@@ -305,7 +315,6 @@ Everything is open.
 | GitHub repo | [shettydevesh/sysadmin](https://github.com/shettydevesh/sysadmin) |
 | SFT Colab notebook | [train_sysadmin.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_sysadmin.ipynb) |
 | GRPO Colab notebook | [train_grpo.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_grpo.ipynb) |
-| W&B training run | *(add link)* |
 
 **To run it locally:**
 

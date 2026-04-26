@@ -14,8 +14,8 @@ The reward is not an AI judge. It's not a human label. It's whether the service 
 | 🧠 Trained model checkpoint | [deveshshetty/sysadmin-grpo](https://huggingface.co/deveshshetty/sysadmin-grpo) |
 | 📓 SFT Colab notebook | [train_sysadmin.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_sysadmin.ipynb) |
 | 📓 GRPO Colab notebook | [train_grpo.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_grpo.ipynb) |
+| 📝 Mini-blog | [Read on HuggingFace](https://huggingface.co/spaces/deveshshetty/sysadmin-game) |
 | 🎬 Demo video | *coming soon* |
-| 📊 W&B training run | *add link* |
 
 ---
 
@@ -77,6 +77,12 @@ The AI types real commands. The shell runs them inside a real container. If ngin
 *Untrained model vs GRPO-trained model on 4 held-out scenarios it never saw during training.*
 
 ![Baseline vs Trained](https://d2qt0ksb47ks9g.cloudfront.net/1777195115503_baseline_vs_trained.png)
+
+### Live Training Log — The Model Learning in Real Time
+
+*Step 1 → reward -0.12, fix rate 0%. Step 2 → reward +0.45, fix rate 50%. Each step is 2 live episodes against real broken containers.*
+
+![Training Log](https://d2qt0ksb47ks9g.cloudfront.net/1777200223681_training_log.jpeg)
 
 ### Evaluation Numbers
 
@@ -191,6 +197,8 @@ The model plays the game itself. We run 4 episodes per step against real broken 
 - Update weights. Next step.
 
 No gold labels. No AI judge. Just: which of your own attempts worked better than average?
+
+> **Note:** The GRPO Colab uses the SFT checkpoint as a warm-start base. This is optional — the GRPO notebook works fine starting from the base model if you don't have an SFT checkpoint.
 
 **→ [Open GRPO Colab](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_grpo.ipynb)**
 
