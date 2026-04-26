@@ -29,18 +29,22 @@ class Config:
     max_seq_length: int = 2048
 
 
-SYSTEM_PROMPT = """You are an expert SRE agent that diagnoses and fixes Linux system issues.
+SYSTEM_PROMPT = """You are a Linux sysadmin agent. You diagnose and fix system issues by running shell commands.
 
-When given a problem:
-1. Think step-by-step about the diagnosis in <think> tags
-2. Run ONE command at a time in <bash> tags
-3. Analyze the output before running the next command
+RULES:
+- Run exactly ONE command per response
+- Wrap your command in <bash> and </bash> tags
+- You may optionally think first in <think> tags
+- Do NOT explain, just run the command
 
-Example:
-<think>
-Check the service status first.
-</think>
-<bash>systemctl status nginx --no-pager -l</bash>"""
+Example response:
+<think>Check what's using port 80</think>
+<bash>ss -tlnp | grep :80</bash>
+
+Another example:
+<bash>systemctl status nginx</bash>
+
+ALWAYS use <bash>command</bash> format. Never use markdown code blocks."""
 
 
 # ============== Training State ==============
@@ -57,8 +61,8 @@ class TrainingState:
 
     def log(self, msg: str):
         self.logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(self.logs) > 100:
-            self.logs = self.logs[-100:]
+        if len(self.logs) > 500:
+            self.logs = self.logs[-500:]
 
 state = TrainingState()
 
@@ -67,38 +71,57 @@ state = TrainingState()
 
 def load_model(model_name: str, progress=gr.Progress()):
     """Load model for training."""
-    progress(0.1, desc="Loading tokenizer...")
-    state.log(f"Loading model: {model_name}")
+    try:
+        progress(0.1, desc="Loading tokenizer...")
+        state.log(f"Loading model: {model_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        state.log(f"Tokenizer loaded, vocab size: {len(tokenizer)}")
 
-    progress(0.3, desc="Loading model...")
+        progress(0.3, desc="Loading model...")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Use bfloat16 for training stability (no GradScaler needed unlike fp16)
+        if device == "cuda" and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif device == "cuda":
+            dtype = torch.float32  # fall back to fp32 if bf16 not supported
+        else:
+            dtype = torch.float32
+        state.log(f"Using device: {device}, dtype: {dtype}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map="auto" if device == "cuda" else None,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map="auto" if device == "cuda" else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
 
-    model.resize_token_embeddings(len(tokenizer))
+        # Don't resize embeddings — Qwen models already match tokenizer size
+        # resize_token_embeddings can introduce uninitialized weights that
+        # cause CUDA asserts during generation on fp16/bf16
+        state.log(f"Model vocab: {model.config.vocab_size}, tokenizer vocab: {len(tokenizer)}")
 
-    if device == "cpu":
-        model = model.to(device)
+        if device == "cpu":
+            model = model.to(device)
 
-    state.model = model
-    state.tokenizer = tokenizer
-    state.log(f"Model loaded on {device}")
+        state.model = model
+        state.tokenizer = tokenizer
+        state.log(f"Model loaded successfully on {device}")
 
-    progress(1.0, desc="Done!")
-    return f"✅ Model loaded: {model_name} on {device}"
+        progress(1.0, desc="Done!")
+        return f"✅ Model loaded: {model_name} on {device}"
+
+    except Exception as e:
+        import traceback
+        err_msg = f"{type(e).__name__}: {str(e)}"
+        state.log(f"Model loading FAILED: {err_msg}")
+        state.log(f"Traceback: {traceback.format_exc()[-500:]}")
+        return f"❌ Failed to load model: {err_msg}"
 
 
 # ============== Real HTTP Environment ==============
@@ -116,32 +139,62 @@ class RealEnvHTTP:
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         from urllib import request as urlrequest
+        from urllib.error import URLError, HTTPError
+        import traceback
+
+        url = f"{self.base_url}{endpoint}"
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        req = urlrequest.Request(
-            f"{self.base_url}{endpoint}", data=data, headers=headers, method="POST"
-        )
-        with urlrequest.urlopen(req, timeout=90.0) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        req = urlrequest.Request(url, data=data, headers=headers, method="POST")
+
+        try:
+            with urlrequest.urlopen(req, timeout=90.0) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except HTTPError as e:
+            # Read error body for details
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")
+            except:
+                pass
+            state.log(f"HTTP {e.code} from {endpoint}: {error_body[:200]}")
+            raise RuntimeError(f"HTTP {e.code} from {endpoint}: {error_body[:100]}") from e
+        except URLError as e:
+            state.log(f"Connection failed to {url}: {e.reason}")
+            raise RuntimeError(f"Cannot connect to {url}: {e.reason}") from e
+        except json.JSONDecodeError as e:
+            state.log(f"Invalid JSON from {endpoint}: {str(e)}")
+            raise RuntimeError(f"Invalid JSON response from {endpoint}") from e
+        except Exception as e:
+            state.log(f"Request failed {endpoint}: {type(e).__name__}: {str(e)}")
+            raise
 
     def reset(self, scenario_id: Optional[str] = None) -> dict:
-        resp = self._post("/reset", {"scenario_id": scenario_id})
-        self.episode_id = resp["metadata"]["episode_id"]
-        return {
-            "output": resp["output"],
-            "done": resp["done"],
-            "reward": resp["reward"],
-            "metadata": resp["metadata"],
-        }
+        try:
+            resp = self._post("/reset", {"scenario_id": scenario_id})
+            self.episode_id = resp["metadata"]["episode_id"]
+            return {
+                "output": resp["output"],
+                "done": resp["done"],
+                "reward": resp["reward"],
+                "metadata": resp["metadata"],
+            }
+        except Exception as e:
+            state.log(f"Reset failed: {type(e).__name__}: {str(e)[:100]}")
+            raise
 
     def step(self, command: str) -> dict:
-        resp = self._post("/step", {"command": command, "episode_id": self.episode_id})
-        return {
-            "output": resp["output"],
-            "done": resp["done"],
-            "reward": resp["reward"],
-            "metadata": resp["metadata"],
-        }
+        try:
+            resp = self._post("/step", {"command": command, "episode_id": self.episode_id})
+            return {
+                "output": resp["output"],
+                "done": resp["done"],
+                "reward": resp["reward"],
+                "metadata": resp["metadata"],
+            }
+        except Exception as e:
+            state.log(f"Step failed for '{command[:30]}': {type(e).__name__}: {str(e)[:80]}")
+            raise
 
 
 def check_env_server(env_url: str) -> str:
@@ -240,14 +293,54 @@ class SimulatedEnv:
 # ============== Episode Runner ==============
 
 def parse_response(response: str) -> Optional[str]:
-    """Extract command from model response."""
+    """Extract command from model response. Handles multiple formats."""
+    # Try <bash>...</bash> tags first (preferred)
     bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
-    return bash_match.group(1).strip() if bash_match else None
+    if bash_match:
+        return bash_match.group(1).strip()
+
+    # Try ```bash or ```sh code blocks
+    code_match = re.search(r"```(?:bash|sh|shell)?\n?(.*?)```", response, re.DOTALL)
+    if code_match:
+        cmd = code_match.group(1).strip()
+        # Take only first line if multiple commands
+        return cmd.split("\n")[0].strip()
+
+    # Try single backtick `command`
+    tick_match = re.search(r"`([^`]+)`", response)
+    if tick_match:
+        cmd = tick_match.group(1).strip()
+        # Only accept if it looks like a command (starts with common commands)
+        cmd_starters = ("ls", "cat", "grep", "find", "ps", "ss", "netstat", "df",
+                        "du", "systemctl", "service", "nginx", "kill", "rm", "mv",
+                        "cp", "chmod", "chown", "apt", "yum", "pip", "docker",
+                        "journalctl", "tail", "head", "less", "more", "lsof",
+                        "free", "top", "htop", "mount", "umount", "fdisk",
+                        "curl", "wget", "ssh", "scp", "tar", "gzip", "fuser",
+                        "truncate", "echo", "sudo", "id", "whoami", "stat")
+        if any(cmd.startswith(s) for s in cmd_starters):
+            return cmd
+
+    # Last resort: look for lines starting with $ or # (shell prompts)
+    prompt_match = re.search(r"^[\$#]\s*(.+)$", response, re.MULTILINE)
+    if prompt_match:
+        return prompt_match.group(1).strip()
+
+    return None
 
 
-def run_episode(env, model, tokenizer, config: Config) -> dict:
+def run_episode(env, model, tokenizer, config: Config, episode_num: int = 0) -> dict:
     """Run single episode against env (real or simulated)."""
-    obs = env.reset()
+    import traceback
+
+    try:
+        obs = env.reset()
+    except Exception as e:
+        state.log(f"  Episode {episode_num}: RESET FAILED - {type(e).__name__}: {str(e)[:100]}")
+        raise RuntimeError(f"Episode reset failed: {e}") from e
+
+    scenario_id = obs["metadata"]["scenario_id"]
+    state.log(f"  Episode {episode_num}: scenario={scenario_id}")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -255,10 +348,11 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
     ]
 
     trajectory = {
-        "scenario_id": obs["metadata"]["scenario_id"],
+        "scenario_id": scenario_id,
         "prompts": [],
         "responses": [],
         "rewards": [],
+        "commands": [],
     }
 
     total_reward = 0.0
@@ -292,15 +386,22 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
 
             trajectory["prompts"].append(prompt)
             trajectory["responses"].append(response)
+            trajectory["commands"].append(command)
 
             if not command:
+                state.log(f"    Turn {turn}: no command extracted, penalty -0.1")
                 trajectory["rewards"].append(-0.1)
                 total_reward -= 0.1
                 break
 
             obs = env.step(command)
-            trajectory["rewards"].append(obs["reward"])
-            total_reward += obs["reward"]
+            reward = obs["reward"]
+            trajectory["rewards"].append(reward)
+            total_reward += reward
+
+            # Log command and reward
+            cmd_short = command[:40] + "..." if len(command) > 40 else command
+            state.log(f"    Turn {turn}: `{cmd_short}` → reward={reward:+.2f}")
 
             messages.append({"role": "assistant", "content": response})
             messages.append(
@@ -308,16 +409,28 @@ def run_episode(env, model, tokenizer, config: Config) -> dict:
             )
 
             if obs["done"]:
+                fixed = obs["metadata"].get("fixed", False)
+                reason = obs["metadata"].get("termination_reason", "unknown")
+                state.log(f"    Done: fixed={fixed}, reason={reason}, total={total_reward:+.2f}")
                 break
 
         except Exception as e:
-            state.log(f"Turn {turn} error: {str(e)[:80]}")
+            import traceback
+            err_type = type(e).__name__
+            err_msg = str(e)[:100]
+            state.log(f"    Turn {turn} ERROR: {err_type}: {err_msg}")
+            # Log full traceback for debugging
+            tb_lines = traceback.format_exc().split('\n')[-4:-1]
+            for line in tb_lines:
+                if line.strip():
+                    state.log(f"      {line.strip()}")
             trajectory["rewards"].append(-0.1)
             total_reward -= 0.1
             break
 
     trajectory["total_reward"] = total_reward
     trajectory["fixed"] = obs["metadata"].get("fixed", False)
+    trajectory["num_commands"] = len([c for c in trajectory["commands"] if c])
     return trajectory
 
 
@@ -343,55 +456,121 @@ def compute_advantages(trajectories: list, group_size: int) -> list:
     return processed
 
 
-def train_step(model, tokenizer, env, config: Config, optimizer) -> tuple:
+def _check_model_health(model) -> bool:
+    """Return True if model weights are healthy (no NaN/Inf)."""
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            state.log(f"  ⚠️ NaN/Inf detected in {name} — model is corrupted!")
+            return False
+    return True
+
+
+def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int = 0) -> tuple:
     """Single GRPO training step."""
+    state.log(f"Step {step_num}: Collecting {config.episodes_per_step} episodes...")
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    trajectories = []
-    for _ in range(config.episodes_per_step):
-        try:
-            traj = run_episode(env, model, tokenizer, config)
-            trajectories.append(traj)
-        except Exception as e:
-            state.log(f"Episode failed: {str(e)[:100]}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    if not trajectories:
+    # Check model health before running episodes
+    if not _check_model_health(model):
+        state.log(f"Step {step_num}: SKIPPING — model weights are corrupted (NaN/Inf). Stop training and reload model.")
         return None, None, None
 
+    trajectories = []
+    consecutive_failures = 0
+    for ep_idx in range(config.episodes_per_step):
+        try:
+            traj = run_episode(env, model, tokenizer, config, episode_num=ep_idx)
+            trajectories.append(traj)
+            consecutive_failures = 0  # Reset on success
+        except Exception as e:
+            consecutive_failures += 1
+            err_type = type(e).__name__
+            state.log(f"  Episode {ep_idx} FAILED: {err_type}: {str(e)[:100]}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # If too many consecutive failures, likely server is down
+            if consecutive_failures >= 3:
+                state.log(f"  ⚠️ {consecutive_failures} consecutive failures - check environment server!")
+                break
+
+    if not trajectories:
+        state.log(f"Step {step_num}: No trajectories collected!")
+        return None, None, None
+
+    # Summarize episodes
     rewards = [t["total_reward"] for t in trajectories]
-    fix_rate = sum(1 for t in trajectories if t["fixed"]) / len(trajectories)
+    fix_count = sum(1 for t in trajectories if t["fixed"])
+    fix_rate = fix_count / len(trajectories)
     avg_reward = sum(rewards) / len(rewards)
+    total_cmds = sum(t.get("num_commands", 0) for t in trajectories)
+
+    state.log(f"Step {step_num}: Episodes done - avg_reward={avg_reward:.3f}, fixed={fix_count}/{len(trajectories)}, commands={total_cmds}")
 
     training_data = compute_advantages(trajectories, config.group_size)
     if not training_data:
+        state.log(f"Step {step_num}: No training data after advantage computation")
         return avg_reward, fix_rate, 0.0
 
+    state.log(f"Step {step_num}: Training on {len(training_data)} examples...")
     model.train()
     total_loss = 0.0
+    valid_examples = 0
+    skipped_nan = 0
+    skipped_error = 0
 
-    for ex in training_data:
-        inputs = tokenizer(
-            ex["prompt"] + ex["response"],
-            return_tensors="pt",
-            truncation=True,
-            max_length=config.max_seq_length,
-        ).to(model.device)
+    for idx, ex in enumerate(training_data):
+        try:
+            inputs = tokenizer(
+                ex["prompt"] + ex["response"],
+                return_tensors="pt",
+                truncation=True,
+                max_length=config.max_seq_length,
+            ).to(model.device)
 
-        outputs = model(**inputs, labels=inputs.input_ids)
-        loss = outputs.loss * ex["advantage"]
+            outputs = model(**inputs, labels=inputs.input_ids)
+            loss = outputs.loss * ex["advantage"]
 
-        if not (torch.isnan(loss) or torch.isinf(loss)):
+            if torch.isnan(loss) or torch.isinf(loss):
+                skipped_nan += 1
+                continue
+
             loss.backward()
             total_loss += loss.item()
+            valid_examples += 1
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    optimizer.zero_grad()
+        except Exception as e:
+            skipped_error += 1
+            if skipped_error <= 2:  # Only log first few errors
+                state.log(f"  Training example {idx} error: {type(e).__name__}: {str(e)[:60]}")
 
-    return avg_reward, fix_rate, total_loss / max(len(training_data), 1)
+    try:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            state.log(f"  ⚠️ Gradient norm is {grad_norm:.4f} — skipping optimizer step to protect model")
+            optimizer.zero_grad()
+        else:
+            optimizer.step()
+            optimizer.zero_grad()
+            state.log(f"  Gradient norm: {grad_norm:.4f}")
+    except Exception as e:
+        state.log(f"  Optimizer step failed: {type(e).__name__}: {str(e)[:80]}")
+        optimizer.zero_grad()  # Clear bad gradients
+
+    avg_loss = total_loss / max(valid_examples, 1)
+
+    # Log summary with any issues
+    issues = []
+    if skipped_nan > 0:
+        issues.append(f"{skipped_nan} NaN")
+    if skipped_error > 0:
+        issues.append(f"{skipped_error} errors")
+    issue_str = f" (skipped: {', '.join(issues)})" if issues else ""
+
+    state.log(f"Step {step_num}: Loss={avg_loss:.4f} (from {valid_examples} examples){issue_str}")
+
+    return avg_reward, fix_rate, avg_loss
 
 
 def run_training(
@@ -399,11 +578,15 @@ def run_training(
     episodes_per_step: int,
     learning_rate: float,
     env_url: str,
-    progress=gr.Progress(),
 ):
-    """Main training loop — uses real HTTP env if env_url is set, else simulated."""
+    """Main training loop — yields live updates after each step.
+
+    Uses real HTTP env if env_url is set, else simulated.
+    This is a generator so Gradio streams status/plot/logs in real-time.
+    """
     if state.model is None:
-        return "❌ Load a model first!", None, ""
+        yield "❌ Load a model first!", None, ""
+        return
 
     config = Config(
         num_steps=int(num_steps),
@@ -428,30 +611,59 @@ def run_training(
     state.log(f"Starting training: {config.num_steps} steps, {config.episodes_per_step} eps/step")
     state.log(f"Environment: {env_label}")
 
-    for step in range(config.num_steps):
-        if not state.is_training:
-            break
+    # Yield initial state so user sees logs immediately
+    yield f"⏳ Starting training...", None, "\n".join(state.logs[-50:])
 
-        state.current_step = step + 1
-        progress((step + 1) / config.num_steps, desc=f"Step {step+1}/{config.num_steps}")
+    try:
+        for step in range(config.num_steps):
+            if not state.is_training:
+                state.log("Training stopped by user")
+                break
 
-        reward, fix_rate, loss = train_step(
-            state.model, state.tokenizer, env, config, optimizer
-        )
+            state.current_step = step + 1
 
-        if reward is not None:
-            state.history["steps"].append(step + 1)
-            state.history["rewards"].append(reward)
-            state.history["fix_rates"].append(fix_rate)
-            state.history["losses"].append(loss)
-            state.log(
-                f"Step {step+1}: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f}"
+            try:
+                reward, fix_rate, loss = train_step(
+                    state.model, state.tokenizer, env, config, optimizer, step_num=step + 1
+                )
+
+                if reward is not None:
+                    state.history["steps"].append(step + 1)
+                    state.history["rewards"].append(reward)
+                    state.history["fix_rates"].append(fix_rate)
+                    state.history["losses"].append(loss)
+                    state.log(
+                        f"═══ Step {step+1} Summary: reward={reward:.3f}, fix={fix_rate:.1%}, loss={loss:.4f} ═══"
+                    )
+            except Exception as e:
+                import traceback
+                state.log(f"Step {step+1} FAILED: {type(e).__name__}: {str(e)[:100]}")
+                state.log(f"  Traceback: {traceback.format_exc()[-300:]}")
+                # Continue to next step instead of crashing
+
+            # Yield after every step so UI updates live
+            fig = create_training_plot()
+            yield (
+                f"⏳ Step {step+1}/{config.num_steps}",
+                fig,
+                "\n".join(state.logs[-50:]),
             )
+            plt.close(fig) if fig else None
 
-    state.is_training = False
-    fig = create_training_plot()
-    final_reward = state.history["rewards"][-1] if state.history["rewards"] else 0.0
-    return f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-20:])
+        state.is_training = False
+        state.log("Training complete!")
+        fig = create_training_plot()
+        final_reward = state.history["rewards"][-1] if state.history["rewards"] else 0.0
+        yield f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-50:])
+
+    except Exception as e:
+        import traceback
+        state.is_training = False
+        err_msg = f"{type(e).__name__}: {str(e)}"
+        state.log(f"Training CRASHED: {err_msg}")
+        state.log(f"Full traceback:\n{traceback.format_exc()}")
+        fig = create_training_plot()
+        yield f"❌ Training failed: {err_msg}", fig, "\n".join(state.logs[-50:])
 
 
 def stop_training():
@@ -608,8 +820,12 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
                 stop_btn = gr.Button("Stop", variant="stop")
 
             train_status = gr.Textbox(label="Status", interactive=False)
-            train_plot = gr.Plot(label="Training Curves")
-            train_logs = gr.Textbox(label="Logs", lines=10, interactive=False)
+            with gr.Row():
+                train_logs = gr.Textbox(
+                    label="Logs", lines=15, interactive=False,
+                    autoscroll=True, scale=3,
+                )
+                train_plot = gr.Plot(label="Training Curves", scale=2)
 
             train_btn.click(
                 run_training,

@@ -4,10 +4,13 @@ import re
 
 # Patterns that indicate destructive commands
 DESTRUCTIVE_PATTERNS = [
-    # Recursive delete of root or important directories
-    # Must match exactly / or /* or /etc etc, not /tmp or /opt
-    r"rm\s+(-[rf]+\s+)*(/\*|/etc|/var|/usr|/home|/boot|/bin|/sbin|/lib)($|\s|/)",
-    r"rm\s+(-[rf]+\s+)*/($|\s)",  # rm / or rm -rf /
+    # Recursive delete of root or critical top-level directories
+    # Block: rm -rf /var, rm -rf /etc, rm -rf /, rm -rf /var/
+    # Allow: rm /var/run/nginx.pid, rm -f /var/log/file.log
+    r"rm\s+-rf\s+/($|\s|\*)",  # rm -rf / or rm -rf /*
+    r"rm\s+-rf\s+/(etc|var|usr|home|boot|bin|sbin|lib)/?($|\s)",  # rm -rf /var or /var/
+    r"rm\s+-fr\s+/($|\s|\*)",  # rm -fr / or rm -fr /*
+    r"rm\s+-fr\s+/(etc|var|usr|home|boot|bin|sbin|lib)/?($|\s)",
     r"rm\s+-[rf]*\s+--no-preserve-root",
 
     # Direct disk writes

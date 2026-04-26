@@ -6,6 +6,7 @@ from docker.errors import NotFound, APIError
 
 
 MAX_OUTPUT_SIZE = 2048  # 2KB truncation
+MAX_CONTAINERS = 2  # Auto-cleanup when exceeded
 
 
 class DockerSandbox:
@@ -19,6 +20,60 @@ class DockerSandbox:
         self.container = None
         self.container_id = None
 
+    @classmethod
+    def cleanup_old_containers(cls, max_keep: int = MAX_CONTAINERS):
+        """Remove old sysadmin containers, keeping only the most recent ones.
+
+        Args:
+            max_keep: Maximum number of containers to keep
+        """
+        try:
+            client = docker.from_env()
+            containers = client.containers.list(
+                all=True,
+                filters={"name": cls.CONTAINER_PREFIX}
+            )
+
+            if len(containers) <= max_keep:
+                return 0
+
+            # Sort by created time (oldest first)
+            containers.sort(key=lambda c: c.attrs.get("Created", ""), reverse=False)
+
+            # Remove oldest containers
+            removed = 0
+            to_remove = len(containers) - max_keep
+            for container in containers[:to_remove]:
+                try:
+                    container.remove(force=True)
+                    removed += 1
+                except Exception:
+                    pass
+
+            return removed
+        except Exception:
+            return 0
+
+    @classmethod
+    def cleanup_all(cls):
+        """Remove ALL sysadmin containers."""
+        try:
+            client = docker.from_env()
+            containers = client.containers.list(
+                all=True,
+                filters={"name": cls.CONTAINER_PREFIX}
+            )
+            removed = 0
+            for container in containers:
+                try:
+                    container.remove(force=True)
+                    removed += 1
+                except Exception:
+                    pass
+            return removed
+        except Exception:
+            return 0
+
     def create(self, name_suffix: str = None) -> str:
         """Create and start a new container.
 
@@ -28,6 +83,9 @@ class DockerSandbox:
         Returns:
             Container ID
         """
+        # Auto-cleanup old containers to prevent pile-up
+        self.cleanup_old_containers(max_keep=MAX_CONTAINERS)
+
         # Generate unique name
         name = f"{self.CONTAINER_PREFIX}{name_suffix or int(time.time() * 1000)}"
 

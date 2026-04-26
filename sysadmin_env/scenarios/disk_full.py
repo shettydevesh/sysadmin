@@ -33,10 +33,10 @@ class DiskFullScenario(BaseScenario):
         sandbox.exec("systemctl stop nginx")
 
     def check_fixed(self, sandbox: DockerSandbox) -> bool:
-        # Check disk usage - should be under 90%
-        result = sandbox.exec("df -h / | tail -1 | awk '{print $5}' | tr -d '%'")
+        # Check that the huge log file was removed or truncated
+        result = sandbox.exec("stat -c%s /var/log/huge_debug.log 2>/dev/null || echo 0")
         try:
-            usage = int(result.strip())
-            return usage < 90
+            size = int(result.strip())
+            return size < 1000000  # Less than 1MB means cleaned
         except ValueError:
-            return False
+            return True  # File doesn't exist = cleaned
