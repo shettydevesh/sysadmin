@@ -19,11 +19,10 @@ DIAGNOSTIC_COMMANDS = {
     "grep": r"\|\s*grep\b|" + _CMD + r"grep\b",  # grep often after pipe
     "head": r"\|\s*head\b|" + _CMD + r"head\b",
     "tail": r"\|\s*tail\b|" + _CMD + r"tail\b",
-    "less": r"\|\s*less\b|" + _CMD + r"less\b",
     "find": _CMD + r"find\b",
     "lsof": _CMD + r"lsof\b",
-    "top": _CMD + r"top\b",
-    "htop": _CMD + r"htop\b",
+    # Only reward non-interactive top usage. Plain top/htop tends to hang or waste turns.
+    "top": _CMD + r"top\b[^\n|;&]*-b",
     "free": _CMD + r"free\b",
     "du": _CMD + r"du\b",
     "stat": _CMD + r"stat\s",  # stat requires argument
@@ -36,9 +35,11 @@ DIAGNOSTIC_COMMANDS = {
 
 # Rewards
 REWARD_FIXED = 1.0
-REWARD_PER_COMMAND = -0.01
-REWARD_DIAGNOSTIC_FIRST_USE = 0.1
+REWARD_PER_COMMAND = -0.02
+REWARD_DIAGNOSTIC_FIRST_USE = 0.05
 REWARD_DESTRUCTIVE = -0.5
+REWARD_INCOMPLETE_TERMINATION = -0.10
+MAX_DIAGNOSTIC_BONUSES = 3
 
 
 def get_diagnostic_used(command: str) -> str | None:
@@ -85,7 +86,11 @@ def calculate_reward(
 
     # Check for diagnostic command bonus
     diagnostic = get_diagnostic_used(command)
-    if diagnostic and diagnostic not in diagnostics_used:
+    if (
+        diagnostic
+        and diagnostic not in diagnostics_used
+        and len(diagnostics_used) < MAX_DIAGNOSTIC_BONUSES
+    ):
         reward += REWARD_DIAGNOSTIC_FIRST_USE
         new_diagnostics.add(diagnostic)
 
@@ -94,3 +99,17 @@ def calculate_reward(
         reward += REWARD_FIXED
 
     return reward, new_diagnostics
+
+
+def get_termination_adjustment(termination_reason: str | None, fixed: bool) -> float:
+    """Penalty applied when an episode ends unfinished.
+
+    Timeout or command-budget terminations should be meaningfully worse than
+    partial diagnostic progress, otherwise the policy can plateau on "busy"
+    traces that never complete the repair.
+    """
+    if fixed:
+        return 0.0
+    if termination_reason in {"timeout", "max_commands"}:
+        return REWARD_INCOMPLETE_TERMINATION
+    return 0.0

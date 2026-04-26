@@ -1,5 +1,6 @@
 """Core environment implementation."""
 
+import os
 import time
 import random
 from uuid import uuid4
@@ -7,14 +8,14 @@ from typing import Optional
 
 from .models import Action, Observation, State
 from .sandbox import DockerSandbox
-from .reward import calculate_reward
+from .reward import calculate_reward, get_termination_adjustment
 from .blocklist import is_destructive
 from .scenarios import get_scenario, get_random_scenario, TRAIN_SCENARIO_IDS
 
 
 # Episode constraints
 MAX_COMMANDS = 25
-MAX_TIME_SECONDS = 60
+MAX_TIME_SECONDS = int(os.getenv("SYSADMIN_MAX_TIME_SECONDS", "90"))
 
 
 class SysadminEnv:
@@ -185,6 +186,11 @@ class SysadminEnv:
             elif elapsed >= MAX_TIME_SECONDS:
                 termination_reason = "timeout"
 
+            terminal_adjustment = get_termination_adjustment(termination_reason, fixed)
+            if terminal_adjustment:
+                reward += terminal_adjustment
+                self._state.total_reward += terminal_adjustment
+
         return Observation(
             output=output,
             done=done,
@@ -198,6 +204,7 @@ class SysadminEnv:
                 "fixed": fixed,
                 "elapsed_time": elapsed,
                 "termination_reason": termination_reason,
+                "max_time_seconds": MAX_TIME_SECONDS,
             },
         )
 

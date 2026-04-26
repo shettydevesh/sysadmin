@@ -184,8 +184,7 @@ After 50 steps, the model has played through 200 real broken server episodes. Af
 
 *Shows average episode reward per training step. Upward trend = model learning to fix servers more efficiently.*
 
-<!-- INSERT: results/reward_curve.png -->
-![Reward Curve](results/reward_curve.png)
+![Reward Curve](https://d2qt0ksb47ks9g.cloudfront.net/1777195101830_reward.png)
 
 ---
 
@@ -193,8 +192,7 @@ After 50 steps, the model has played through 200 real broken server episodes. Af
 
 *Percentage of episodes where the model actually fixed the broken service. Measured on held-out scenarios not seen during training.*
 
-<!-- INSERT: results/success_rate.png -->
-![Success Rate](results/success_rate.png)
+![Success Rate](https://d2qt0ksb47ks9g.cloudfront.net/1777195082383_success_rate.png)
 
 ---
 
@@ -202,8 +200,7 @@ After 50 steps, the model has played through 200 real broken server episodes. Af
 
 *Side-by-side comparison of untrained model vs GRPO-trained model. Same scenarios, same broken servers.*
 
-<!-- INSERT: results/baseline_vs_trained.png -->
-![Baseline vs Trained](results/baseline_vs_trained.png)
+![Baseline vs Trained](https://d2qt0ksb47ks9g.cloudfront.net/1777195115503_baseline_vs_trained.png)
 
 ---
 
@@ -211,8 +208,7 @@ After 50 steps, the model has played through 200 real broken server episodes. Af
 
 *Average number of commands needed to fix a scenario. Fewer = better. The model learns not to spam useless commands.*
 
-<!-- INSERT: results/commands_to_fix.png -->
-![Commands to Fix](results/commands_to_fix.png)
+![Commands to Fix](https://d2qt0ksb47ks9g.cloudfront.net/1777195108774_commands.png)
 
 ---
 

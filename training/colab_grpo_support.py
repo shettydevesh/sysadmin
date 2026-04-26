@@ -12,6 +12,7 @@ import json
 import re
 import textwrap
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +50,25 @@ DEFAULT_TRAIN_SCENARIOS = [
     "port_bound",
     "runaway_cpu",
 ]
+
+FALLBACK_COMMAND_RE = re.compile(
+    r"^(?:\$+\s*)?(?:"
+    r"systemctl|journalctl|nginx|apache2ctl|ss|netstat|lsof|ps|top|df|du|find|grep|awk|sed|perl|python3?|"
+    r"cat|ls|stat|file|id|whoami|chmod|chown|chgrp|rm|truncate|kill|pkill|killall|service|curl|nohup"
+    r")\b"
+)
+INTERACTIVE_COMMAND_PATTERNS = [
+    re.compile(r"(^|[;&|]\s*)(nano|vi|vim|view)\b", re.IGNORECASE),
+    re.compile(r"(^|[;&|]\s*)(less|more|man|watch|tail\s+-f)\b", re.IGNORECASE),
+    re.compile(r"(^|[;&|]\s*)(top|htop)\b(?![^\n|;&]*-b)", re.IGNORECASE),
+]
+IRRELEVANT_COMMAND_PATTERNS = [
+    re.compile(r"(^|[;&|]\s*)apt(-get)?\s+update\b", re.IGNORECASE),
+    re.compile(r"(^|[;&|]\s*)apt(-get)?\s+install\b", re.IGNORECASE),
+    re.compile(r"(^|[;&|]\s*)pip3?\s+install\b", re.IGNORECASE),
+    re.compile(r"(^|[;&|]\s*)clear\b", re.IGNORECASE),
+]
+PLACEHOLDER_PATTERN = re.compile(r"<[A-Z][A-Z0-9_ -]*>")
 
 
 ANSI = {
@@ -160,8 +180,27 @@ def parse_response(response: str) -> tuple[str | None, str | None]:
     think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
     bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
     thinking = think_match.group(1).strip() if think_match else None
-    command = bash_match.group(1).strip() if bash_match else None
+    command = bash_match.group(1).strip() if bash_match else extract_fallback_command(response)
     return thinking, command
+
+
+def extract_fallback_command(response: str) -> str | None:
+    """Recover a plain shell command when the model forgets <bash> tags."""
+    fenced_match = re.search(r"```(?:bash|sh)?\n(.*?)```", response, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip().splitlines()
+        for line in candidate:
+            line = line.strip()
+            if line and FALLBACK_COMMAND_RE.match(line):
+                return line.lstrip("$").strip()
+
+    for raw_line in response.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if FALLBACK_COMMAND_RE.match(line):
+            return line.lstrip("$").strip()
+    return None
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -177,10 +216,51 @@ def normalize_command(command: str | None) -> str | None:
     """Normalize commands to reduce wasted turns on notebook-only quirks."""
     if not command:
         return command
-    command = command.strip()
+    command = command.strip().strip("`")
+    command = re.sub(r"^\$+\s*", "", command)
     if command.startswith("sudo "):
         command = command[5:].strip()
+    command = re.sub(r"^\s*export\s+TERM=[^;]+;\s*", "", command)
+    command = re.sub(r"\s+", " ", command).strip()
     return command
+
+
+def canonicalize_command(command: str | None) -> str | None:
+    """Collapse whitespace and notebook wrappers for loop detection."""
+    if not command:
+        return None
+    command = normalize_command(command)
+    if not command:
+        return None
+    return command.lower()
+
+
+def classify_blocked_command(command: str | None) -> tuple[str, str, str] | None:
+    """Return (reason, output, penalty_key) for notebook-side blocked commands."""
+    if not command:
+        return None
+    if PLACEHOLDER_PATTERN.search(command):
+        return (
+            "placeholder_command",
+            "Blocked locally because the command still contains a placeholder like <PID> instead of a real value.",
+            "placeholder_command_penalty",
+        )
+    for pattern in INTERACTIVE_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return (
+                "interactive_command",
+                "Blocked locally because interactive editors or live TUI commands waste turns in this environment. "
+                "Use a non-interactive command instead.",
+                "interactive_command_penalty",
+            )
+    for pattern in IRRELEVANT_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return (
+                "irrelevant_command",
+                "Blocked locally because package installation or screen-control commands are not part of the repair path here.",
+                "irrelevant_command_penalty",
+            )
+    return None
 
 
 def scenario_hint(complaint: str, scenario_id: str | None = None) -> str:
@@ -191,22 +271,23 @@ def scenario_hint(complaint: str, scenario_id: str | None = None) -> str:
     if "disk" in text or "space left" in text or "disk_full" in sid:
         return (
             "Disk incidents: after confirming the filesystem is full, move quickly to a large file under "
-            "/var/log using du or find, truncate or remove the specific culprit, then verify free space."
+            "/var/log using du or find, truncate or remove the specific culprit, then verify free space. "
+            "Target the bad file directly instead of deleting broad directories."
         )
     if "address already in use" in text or "port" in text or "port_bound" in sid:
         return (
             "Port conflicts: find the current listener with ss or lsof, stop the conflicting service, "
-            "then start the target service and verify it is listening."
+            "then start nginx and verify it is listening on port 80. Do not install packages."
         )
     if "config" in text or "syntax" in text or "directive" in text or "nginx" in text:
         return (
             "Config failures: inspect service status, run the service's config test, fix the exact bad line, "
-            "then validate again before restarting."
+            "then validate again before restarting. Use sed, perl, python, cat, or tee for non-interactive edits."
         )
     if "cpu" in text or "slow" in text or "load" in text or "runaway_cpu" in sid:
         return (
-            "CPU incidents: identify the top process, inspect what it is, stop the runaway job, "
-            "and verify the load starts dropping."
+            "CPU incidents: use non-interactive inspection like ps aux --sort=-%cpu or top -bn1, identify the runaway job, "
+            "stop it, and verify the bad processes are gone."
         )
     if "certificate" in text or "https" in text or "cert" in text or "expired_cert" in sid:
         return (
@@ -226,7 +307,7 @@ def scenario_hint(complaint: str, scenario_id: str | None = None) -> str:
     if "permission" in text or "chmod" in text or "ownership" in sid:
         return (
             "Permission incidents: check ownership and mode on the exact file named in the error, "
-            "restore expected ownership, then restart and verify."
+            "restore expected ownership like root:root plus the expected mode, then restart nginx and verify."
         )
     return (
         "Do not repeat the same diagnostic unless new information appeared. After 1-2 diagnostics, "
@@ -243,6 +324,9 @@ def build_runtime_system_prompt(base_prompt: str, complaint: str, scenario_id: s
         f"- {hint}\n"
         "- Avoid repeating the same command pattern unless it answers a new question.\n"
         "- Avoid using sudo in this sandbox.\n"
+        "- Never use interactive editors or pagers such as nano, vim, vi, less, more, top, or htop.\n"
+        "- Do not install packages during the episode.\n"
+        "- Return exactly one shell command inside <bash>...</bash> on every step.\n"
         "- Aim to diagnose, fix, and verify within the available turn budget.\n"
     )
 
@@ -287,7 +371,7 @@ def print_episode_log(episode_idx: int, trajectory: dict[str, Any]) -> None:
     )
     trail = [cmd for cmd in trajectory["commands"] if cmd]
     if trail:
-        preview = " -> ".join(trail[:3])
+        preview = " -> ".join(trail[:4])
         print(style(f"      trail: {preview}", "dim"))
 
 
@@ -454,7 +538,26 @@ def run_episode_live(
             trajectory["commands"].append(command)
             event["command"] = command
 
-            if command in seen_commands:
+            blocked = classify_blocked_command(command)
+            if blocked:
+                reason, message, penalty_key = blocked
+                penalty = config.get(penalty_key, -0.15)
+                total_reward += penalty
+                trajectory["rewards"].append(penalty)
+                event["reward"] = penalty
+                event["termination_reason"] = reason
+                event["output_preview"] = message
+                trajectory["events"].append(event)
+                final_obs = Observation(
+                    output=message,
+                    done=True,
+                    reward=penalty,
+                    metadata={"fixed": False, "termination_reason": reason},
+                )
+                break
+
+            command_key = canonicalize_command(command)
+            if command_key in seen_commands:
                 repeated_command_count += 1
                 if repeated_command_count >= config.get("max_repeat_commands", 2):
                     penalty = config.get("repeat_command_penalty", -0.03)
@@ -474,7 +577,7 @@ def run_episode_live(
                     )
                     break
             else:
-                seen_commands.add(command)
+                seen_commands.add(command_key)
 
             final_obs = client.step(command)
             trajectory["rewards"].append(final_obs.reward)
@@ -635,6 +738,7 @@ def build_step_summary(
 ) -> dict[str, Any]:
     """Create a judge-friendly per-step summary object."""
     by_scenario: dict[str, dict[str, Any]] = {}
+    termination_counts: Counter[str] = Counter()
     for traj in trajectories:
         stats = by_scenario.setdefault(
             traj["scenario_id"],
@@ -643,6 +747,7 @@ def build_step_summary(
         stats["attempts"] += 1
         stats["fixes"] += int(traj["fixed"])
         stats["avg_reward_accum"] += traj["total_reward"]
+        termination_counts[traj["termination_reason"]] += 1
 
     for stats in by_scenario.values():
         stats["avg_reward"] = round(stats["avg_reward_accum"] / stats["attempts"], 3)
@@ -657,6 +762,7 @@ def build_step_summary(
         "avg_loss": round(avg_loss, 6),
         "num_successful_episodes": len(trajectories),
         "num_failed_episodes": len(failures),
+        "termination_counts": dict(sorted(termination_counts.items())),
         "scenarios": by_scenario,
         "failures": failures,
         "example_episode": example,
@@ -704,6 +810,16 @@ def write_judge_report(
             ]
         )
 
+    termination_totals: Counter[str] = Counter()
+    for summary in step_summaries:
+        termination_totals.update(summary.get("termination_counts", {}))
+
+    if termination_totals:
+        lines.extend(["## Termination Reasons", ""])
+        for reason, count in sorted(termination_totals.items()):
+            lines.append(f"- `{reason}`: {count}")
+        lines.append("")
+
     lines.extend(["## Scenario Totals", ""])
     for scenario_id, stats in sorted(scenario_stats.items()):
         attempts = stats["attempts"]
@@ -716,7 +832,8 @@ def write_judge_report(
         lines.append(
             f"- Step {summary['step']}: reward={summary['avg_reward']:+.3f}, "
             f"fix_rate={summary['fix_rate']:.1%}, avg_cmds={summary['avg_commands']:.2f}, "
-            f"loss={summary['avg_loss']:.4f}, failures={summary['num_failed_episodes']}"
+            f"loss={summary['avg_loss']:.4f}, failures={summary['num_failed_episodes']}, "
+            f"endings={summary.get('termination_counts', {})}"
         )
 
     example_episode = None

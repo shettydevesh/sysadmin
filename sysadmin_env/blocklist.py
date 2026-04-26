@@ -38,7 +38,8 @@ DESTRUCTIVE_PATTERNS = [
     # Overwrite critical files
     r">\s*/etc/passwd",
     r">\s*/etc/shadow",
-    r"truncate\s+.*(/etc|/var|/usr)",
+    # Allow targeted log cleanup under /var/log for disk-full incidents.
+    r"truncate\s+.*(/etc|/usr|/boot|/bin|/sbin|/lib|/var/lib|/var/run)",
 
     # Kill all processes
     r"kill\s+-9\s+-1",
