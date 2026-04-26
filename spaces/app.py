@@ -29,18 +29,22 @@ class Config:
     max_seq_length: int = 2048
 
 
-SYSTEM_PROMPT = """You are an expert SRE agent that diagnoses and fixes Linux system issues.
+SYSTEM_PROMPT = """You are a Linux sysadmin agent. You diagnose and fix system issues by running shell commands.
 
-When given a problem:
-1. Think step-by-step about the diagnosis in <think> tags
-2. Run ONE command at a time in <bash> tags
-3. Analyze the output before running the next command
+RULES:
+- Run exactly ONE command per response
+- Wrap your command in <bash> and </bash> tags
+- You may optionally think first in <think> tags
+- Do NOT explain, just run the command
 
-Example:
-<think>
-Check the service status first.
-</think>
-<bash>systemctl status nginx --no-pager -l</bash>"""
+Example response:
+<think>Check what's using port 80</think>
+<bash>ss -tlnp | grep :80</bash>
+
+Another example:
+<bash>systemctl status nginx</bash>
+
+ALWAYS use <bash>command</bash> format. Never use markdown code blocks."""
 
 
 # ============== Training State ==============
@@ -80,7 +84,13 @@ def load_model(model_name: str, progress=gr.Progress()):
         progress(0.3, desc="Loading model...")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        # Use bfloat16 for training stability (no GradScaler needed unlike fp16)
+        if device == "cuda" and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif device == "cuda":
+            dtype = torch.float32  # fall back to fp32 if bf16 not supported
+        else:
+            dtype = torch.float32
         state.log(f"Using device: {device}, dtype: {dtype}")
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -91,7 +101,10 @@ def load_model(model_name: str, progress=gr.Progress()):
             trust_remote_code=True,
         )
 
-        model.resize_token_embeddings(len(tokenizer))
+        # Don't resize embeddings — Qwen models already match tokenizer size
+        # resize_token_embeddings can introduce uninitialized weights that
+        # cause CUDA asserts during generation on fp16/bf16
+        state.log(f"Model vocab: {model.config.vocab_size}, tokenizer vocab: {len(tokenizer)}")
 
         if device == "cpu":
             model = model.to(device)
@@ -280,9 +293,40 @@ class SimulatedEnv:
 # ============== Episode Runner ==============
 
 def parse_response(response: str) -> Optional[str]:
-    """Extract command from model response."""
+    """Extract command from model response. Handles multiple formats."""
+    # Try <bash>...</bash> tags first (preferred)
     bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
-    return bash_match.group(1).strip() if bash_match else None
+    if bash_match:
+        return bash_match.group(1).strip()
+
+    # Try ```bash or ```sh code blocks
+    code_match = re.search(r"```(?:bash|sh|shell)?\n?(.*?)```", response, re.DOTALL)
+    if code_match:
+        cmd = code_match.group(1).strip()
+        # Take only first line if multiple commands
+        return cmd.split("\n")[0].strip()
+
+    # Try single backtick `command`
+    tick_match = re.search(r"`([^`]+)`", response)
+    if tick_match:
+        cmd = tick_match.group(1).strip()
+        # Only accept if it looks like a command (starts with common commands)
+        cmd_starters = ("ls", "cat", "grep", "find", "ps", "ss", "netstat", "df",
+                        "du", "systemctl", "service", "nginx", "kill", "rm", "mv",
+                        "cp", "chmod", "chown", "apt", "yum", "pip", "docker",
+                        "journalctl", "tail", "head", "less", "more", "lsof",
+                        "free", "top", "htop", "mount", "umount", "fdisk",
+                        "curl", "wget", "ssh", "scp", "tar", "gzip", "fuser",
+                        "truncate", "echo", "sudo", "id", "whoami", "stat")
+        if any(cmd.startswith(s) for s in cmd_starters):
+            return cmd
+
+    # Last resort: look for lines starting with $ or # (shell prompts)
+    prompt_match = re.search(r"^[\$#]\s*(.+)$", response, re.MULTILINE)
+    if prompt_match:
+        return prompt_match.group(1).strip()
+
+    return None
 
 
 def run_episode(env, model, tokenizer, config: Config, episode_num: int = 0) -> dict:
@@ -412,12 +456,26 @@ def compute_advantages(trajectories: list, group_size: int) -> list:
     return processed
 
 
+def _check_model_health(model) -> bool:
+    """Return True if model weights are healthy (no NaN/Inf)."""
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            state.log(f"  ⚠️ NaN/Inf detected in {name} — model is corrupted!")
+            return False
+    return True
+
+
 def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int = 0) -> tuple:
     """Single GRPO training step."""
     state.log(f"Step {step_num}: Collecting {config.episodes_per_step} episodes...")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Check model health before running episodes
+    if not _check_model_health(model):
+        state.log(f"Step {step_num}: SKIPPING — model weights are corrupted (NaN/Inf). Stop training and reload model.")
+        return None, None, None
 
     trajectories = []
     consecutive_failures = 0
@@ -488,11 +546,17 @@ def train_step(model, tokenizer, env, config: Config, optimizer, step_num: int =
                 state.log(f"  Training example {idx} error: {type(e).__name__}: {str(e)[:60]}")
 
     try:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            state.log(f"  ⚠️ Gradient norm is {grad_norm:.4f} — skipping optimizer step to protect model")
+            optimizer.zero_grad()
+        else:
+            optimizer.step()
+            optimizer.zero_grad()
+            state.log(f"  Gradient norm: {grad_norm:.4f}")
     except Exception as e:
         state.log(f"  Optimizer step failed: {type(e).__name__}: {str(e)[:80]}")
+        optimizer.zero_grad()  # Clear bad gradients
 
     avg_loss = total_loss / max(valid_examples, 1)
 
@@ -514,11 +578,15 @@ def run_training(
     episodes_per_step: int,
     learning_rate: float,
     env_url: str,
-    progress=gr.Progress(),
 ):
-    """Main training loop — uses real HTTP env if env_url is set, else simulated."""
+    """Main training loop — yields live updates after each step.
+
+    Uses real HTTP env if env_url is set, else simulated.
+    This is a generator so Gradio streams status/plot/logs in real-time.
+    """
     if state.model is None:
-        return "❌ Load a model first!", None, ""
+        yield "❌ Load a model first!", None, ""
+        return
 
     config = Config(
         num_steps=int(num_steps),
@@ -543,6 +611,9 @@ def run_training(
     state.log(f"Starting training: {config.num_steps} steps, {config.episodes_per_step} eps/step")
     state.log(f"Environment: {env_label}")
 
+    # Yield initial state so user sees logs immediately
+    yield f"⏳ Starting training...", None, "\n".join(state.logs[-50:])
+
     try:
         for step in range(config.num_steps):
             if not state.is_training:
@@ -550,7 +621,6 @@ def run_training(
                 break
 
             state.current_step = step + 1
-            progress((step + 1) / config.num_steps, desc=f"Step {step+1}/{config.num_steps}")
 
             try:
                 reward, fix_rate, loss = train_step(
@@ -570,13 +640,21 @@ def run_training(
                 state.log(f"Step {step+1} FAILED: {type(e).__name__}: {str(e)[:100]}")
                 state.log(f"  Traceback: {traceback.format_exc()[-300:]}")
                 # Continue to next step instead of crashing
-                continue
+
+            # Yield after every step so UI updates live
+            fig = create_training_plot()
+            yield (
+                f"⏳ Step {step+1}/{config.num_steps}",
+                fig,
+                "\n".join(state.logs[-50:]),
+            )
+            plt.close(fig) if fig else None
 
         state.is_training = False
         state.log("Training complete!")
         fig = create_training_plot()
         final_reward = state.history["rewards"][-1] if state.history["rewards"] else 0.0
-        return f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-50:])
+        yield f"✅ Training complete! Final reward: {final_reward:.3f}", fig, "\n".join(state.logs[-50:])
 
     except Exception as e:
         import traceback
@@ -585,7 +663,7 @@ def run_training(
         state.log(f"Training CRASHED: {err_msg}")
         state.log(f"Full traceback:\n{traceback.format_exc()}")
         fig = create_training_plot()
-        return f"❌ Training failed: {err_msg}", fig, "\n".join(state.logs[-50:])
+        yield f"❌ Training failed: {err_msg}", fig, "\n".join(state.logs[-50:])
 
 
 def stop_training():
@@ -714,8 +792,12 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
                 stop_btn = gr.Button("Stop", variant="stop")
 
             train_status = gr.Textbox(label="Status", interactive=False)
-            train_plot = gr.Plot(label="Training Curves")
-            train_logs = gr.Textbox(label="Logs", lines=20, interactive=False)
+            with gr.Row():
+                train_logs = gr.Textbox(
+                    label="Logs", lines=15, interactive=False,
+                    autoscroll=True, scale=3,
+                )
+                train_plot = gr.Plot(label="Training Curves", scale=2)
 
             train_btn.click(
                 run_training,
