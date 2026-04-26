@@ -460,6 +460,34 @@ def stop_training():
     return "Training stopped"
 
 
+# ============== Save Model ==============
+
+def save_model_to_hub(repo_id: str, hf_token: str, progress=gr.Progress()):
+    """Push the trained model + tokenizer to a HuggingFace Hub repo."""
+    if state.model is None:
+        return "❌ No model loaded. Train first."
+    if not repo_id.strip():
+        return "❌ Enter a repo name like: deveshshetty/sysadmin-grpo"
+    if not hf_token.strip():
+        return "❌ Enter your HuggingFace write token."
+
+    try:
+        from huggingface_hub import login
+        login(token=hf_token.strip())
+
+        progress(0.2, desc="Saving tokenizer...")
+        state.tokenizer.push_to_hub(repo_id.strip(), private=False)
+
+        progress(0.6, desc="Saving model (this takes 1-2 min)...")
+        state.model.push_to_hub(repo_id.strip(), private=False)
+
+        progress(1.0, desc="Done!")
+        state.log(f"Model pushed to hub: {repo_id.strip()}")
+        return f"✅ Model saved to https://huggingface.co/{repo_id.strip()}"
+    except Exception as e:
+        return f"❌ Save failed: {e}"
+
+
 def create_training_plot():
     """Create training curves plot."""
     if not state.history["steps"]:
@@ -610,6 +638,34 @@ with gr.Blocks(title="Sysadmin Game - GRPO Training", theme=gr.themes.Soft()) as
                     ["Getting permission denied when trying to read /var/log/syslog"],
                 ],
                 inputs=[complaint_input],
+            )
+
+        # ── Save Tab ───────────────────────────────────────────────────────────
+        with gr.Tab("4. Save Model"):
+            gr.Markdown("### Push Trained Model to HuggingFace Hub")
+            gr.Markdown(
+                "Run this **immediately after training** — the model lives only in GPU memory "
+                "and will be lost if the Space restarts."
+            )
+            with gr.Row():
+                hub_repo = gr.Textbox(
+                    label="Hub Repo (will be created if it doesn't exist)",
+                    placeholder="deveshshetty/sysadmin-grpo",
+                    scale=3,
+                )
+                hub_token = gr.Textbox(
+                    label="HF Write Token",
+                    placeholder="hf_...",
+                    type="password",
+                    scale=2,
+                )
+            save_btn = gr.Button("Save Model to Hub", variant="primary")
+            save_status = gr.Textbox(label="Status", interactive=False)
+
+            save_btn.click(
+                save_model_to_hub,
+                inputs=[hub_repo, hub_token],
+                outputs=[save_status],
             )
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
