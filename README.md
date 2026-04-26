@@ -5,11 +5,9 @@
 | Resource | Link |
 |---|---|
 | 🤗 HF Space (live environment) | [deveshshetty/sysadmin-game](https://huggingface.co/spaces/deveshshetty/sysadmin-game) |
-| 🧠 Trained model | [deveshshetty/sysadmin-grpo](https://huggingface.co/deveshshetty/sysadmin-grpo) |
 | 💻 GitHub repo | [shettydevesh/sysadmin](https://github.com/shettydevesh/sysadmin) |
 | 📓 SFT Colab | [train_sysadmin.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_sysadmin.ipynb) |
 | 📓 GRPO Colab | [train_grpo.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_grpo.ipynb) |
-| 🎬 Demo video | *coming soon* |
 
 ---
 
