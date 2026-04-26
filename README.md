@@ -58,25 +58,25 @@ The AI types real commands. The shell runs them inside a real container. If ngin
 
 *Average episode reward per step. Each step = 4 live episodes against real broken Ubuntu containers.*
 
-![Average Reward](results/reward.png)
+![Average Reward](https://d2qt0ksb47ks9g.cloudfront.net/1777195101830_reward.png)
 
 ### Success Rate — 6% → 65%
 
 *Percentage of episodes where the model actually fixed the service. Starts nearly random, climbs consistently.*
 
-![Success Rate](results/success_rate.png)
+![Success Rate](https://d2qt0ksb47ks9g.cloudfront.net/1777195082383_success_rate.png)
 
 ### Commands to Fix — 23 → 6
 
 *Average commands needed to fix a scenario. The model learns to diagnose first instead of spamming restarts.*
 
-![Commands to Fix](results/commands.png)
+![Commands to Fix](https://d2qt0ksb47ks9g.cloudfront.net/1777195108774_commands.png)
 
 ### Baseline vs Trained — Same Scenarios, Same Broken Servers
 
 *Untrained model vs GRPO-trained model on 4 held-out scenarios it never saw during training.*
 
-![Baseline vs Trained](results/baseline_vs_trained.png)
+![Baseline vs Trained](https://d2qt0ksb47ks9g.cloudfront.net/1777195115503_baseline_vs_trained.png)
 
 ### Evaluation Numbers
 

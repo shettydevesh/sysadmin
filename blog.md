@@ -302,8 +302,9 @@ Everything is open.
 |---|---|
 | HuggingFace Space (live environment) | [deveshshetty/sysadmin-game](https://huggingface.co/spaces/deveshshetty/sysadmin-game) |
 | Trained model checkpoint | [deveshshetty/sysadmin-grpo](https://huggingface.co/deveshshetty/sysadmin-grpo) |
-| GitHub repo | *(add link)* |
-| Colab training notebook | *(add link)* |
+| GitHub repo | [shettydevesh/sysadmin](https://github.com/shettydevesh/sysadmin) |
+| SFT Colab notebook | [train_sysadmin.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_sysadmin.ipynb) |
+| GRPO Colab notebook | [train_grpo.ipynb](https://colab.research.google.com/github/shettydevesh/sysadmin/blob/main/notebooks/train_grpo.ipynb) |
 | W&B training run | *(add link)* |
 
 **To run it locally:**
